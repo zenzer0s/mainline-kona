@@ -26442,6 +26442,13 @@ S:	Maintained
 F:	Documentation/devicetree/bindings/regulator/silergy,sy8106a.yaml
 F:	drivers/regulator/sy8106a-regulator.c
 
+SYNAPTICS S3908 TOUCHSCREEN DRIVER
+M:	Casey Connolly <kcxt@postmarketos.org>
+L:	linux-input@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/input/touchscreen/syna,s3908.yaml
+F:	drivers/input/touchscreen/synaptics_s3908.c
+
 SYNC FILE FRAMEWORK
 M:	Sumit Semwal <sumit.semwal@linaro.org>
 L:	linux-media@vger.kernel.org

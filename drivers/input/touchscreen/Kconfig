@@ -540,6 +540,17 @@ config TOUCHSCREEN_S6SY761
 	  To compile this driver as module, choose M here: the
 	  module will be called s6sy761.
 
+config TOUCHSCREEN_SYNAPTICS_S3908
+	tristate "Synaptics S3908 Touchscreen driver"
+	depends on I2C
+	help
+	  Say Y if you have the Synaptics S3908 TCM Oncell
+
+	  If unsure, say N
+
+	  To compile this driver as module, choose M here: the
+	  module will be called synaptics_s3908.
+
 config TOUCHSCREEN_GUNZE
 	tristate "Gunze AHL-51S touchscreen"
 	select SERIO
