@@ -92,7 +92,9 @@ static struct vfsmount *shm_mnt __ro_after_init;
 
 #include "internal.h"
 
-#ifdef CONFIG_ASHMEM
+#if defined(CONFIG_MEMFD_ASHMEM_SHIM)
+#include "memfd-ashmem-shim.h"
+#elif defined(CONFIG_ASHMEM)
 #include "../drivers/staging/android/ashmem.h"
 #endif
 
@@ -5304,7 +5306,7 @@ static const struct address_space_operations shmem_aops = {
 	.error_remove_folio = shmem_error_remove_folio,
 };
 
-#ifdef CONFIG_ASHMEM
+#if defined(CONFIG_ASHMEM)
 static long shmem_ashmem_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	if (!(SHMEM_I(file_inode(file))->flags & SHMEM_FL_MEMFD))
@@ -5326,7 +5328,12 @@ static const struct file_operations shmem_file_operations = {
 	.splice_write	= iter_file_splice_write,
 	.fallocate	= shmem_fallocate,
 #endif
-#ifdef CONFIG_ASHMEM
+#if defined(CONFIG_MEMFD_ASHMEM_SHIM)
+	.unlocked_ioctl	= memfd_ashmem_shim_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= memfd_ashmem_shim_compat_ioctl,
+#endif
+#elif defined(CONFIG_ASHMEM)
 	.unlocked_ioctl	= shmem_ashmem_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl	= shmem_ashmem_ioctl,
