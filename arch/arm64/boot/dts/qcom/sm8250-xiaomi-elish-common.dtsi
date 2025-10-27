@@ -1287,7 +1287,7 @@
 		pins = "gpio20";
 		function = "gpio";
 		drive-strength = <16>;
-		output-low;
+		output-high;
 		bias-pull-up;
 	};
 
