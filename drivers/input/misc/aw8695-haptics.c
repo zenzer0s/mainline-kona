@@ -18,6 +18,7 @@
 
 #define AW8624_CHIPID			0x24
 #define AW8695_CHIPID			0x95
+#define AW8697_CHIPID			0x97
 #define AW8695_RESET			0xaa
 /* Default of BASE_ADDR* registers */
 #define AW8695_RAM_BASE_ADDR		0x800
@@ -1009,9 +1010,14 @@ static int aw8695_init(struct aw8695_data *haptics)
 		return err;
 	}
 
-	if (read_buf != AW8695_CHIPID && read_buf != AW8624_CHIPID) {
-		dev_err(dev, "Chip ID mismatch: expected %x or %x, got %x\n",
-			AW8624_CHIPID, AW8695_CHIPID, read_buf);
+	switch (read_buf) {
+	case AW8624_CHIPID:
+	case AW8695_CHIPID:
+	case AW8697_CHIPID:
+		break;
+	default:
+		dev_err(dev, "Chip ID mismatch: expected %x|%x|%x, got %x\n",
+			AW8624_CHIPID, AW8695_CHIPID, AW8697_CHIPID, read_buf);
 		return -ENODEV;
 	}
 
@@ -1376,6 +1382,7 @@ static int aw8695_probe(struct i2c_client *client)
 static const struct of_device_id aw8695_of_id[] = {
 	{ .compatible = "awinic,aw8624", },
 	{ .compatible = "awinic,aw8695", },
+	{ .compatible = "awinic,aw8697", },
 	{ /* sentinel */ }
 };
 
