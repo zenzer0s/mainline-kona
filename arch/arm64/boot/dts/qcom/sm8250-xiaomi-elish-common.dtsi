@@ -1395,6 +1395,13 @@
 		bias-pull-up;
 	};
 
+	camera_front_active: camera-front-active-state {
+		pins = "gpio109";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
 	wlan_en_active: wlan-default-state {
 		pins = "gpio20";
 		function = "gpio";
