@@ -896,6 +896,15 @@ config DRM_PANEL_RONBO_RB070D30
 	  Say Y here if you want to enable support for Ronbo Electronics
 	  RB070D30 1024x600 DSI panel.
 
+config DRM_PANEL_SAMSUNG_AMB655X
+	tristate "Samsung AMB655X panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  Say Y or M here if you want to enable support for the
+	  Samsung AMB655X FHD Plus (2400x1080@120Hz) CMD mode panel.
+
 config DRM_PANEL_SAMSUNG_AMS581VF01
 	tristate "Samsung AMS581VF01 panel"
 	depends on OF
