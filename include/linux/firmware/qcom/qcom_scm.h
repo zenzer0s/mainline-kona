@@ -172,6 +172,8 @@ int qcom_scm_shm_bridge_delete(u64 handle);
 int qcom_scm_qseecom_app_get_id(const char *app_name, u32 *app_id);
 int qcom_scm_qseecom_app_send(u32 app_id, void *req, size_t req_size,
 			      void *rsp, size_t rsp_size);
+int qcom_scm_qseecom_call_raw(u32 owner, u32 svc, u32 cmd, u32 arginfo,
+			      const u64 *args, unsigned int nargs, u64 res[3]);
 
 #else /* CONFIG_QCOM_QSEECOM */
 
@@ -187,12 +189,32 @@ static inline int qcom_scm_qseecom_app_send(u32 app_id,
 	return -EINVAL;
 }
 
+static inline int qcom_scm_qseecom_call_raw(u32 owner, u32 svc, u32 cmd,
+					    u32 arginfo, const u64 *args,
+					    unsigned int nargs, u64 res[3])
+{
+	return -EINVAL;
+}
+
 #endif /* CONFIG_QCOM_QSEECOM */
 
+#if IS_BUILTIN(CONFIG_QCOM_QSEECOM_BRIDGE)
+int qsee_bridge_qtee_listener(u64 res[3]);
+#else
+static inline int qsee_bridge_qtee_listener(u64 res[3])
+{
+	return -EIO;
+}
+#endif
+
+void qcom_scm_qsee_block(void);
+void qcom_scm_qsee_unblock(void);
+void qcom_scm_qtee_lock_acquire(void);
+void qcom_scm_qtee_lock_release(void);
 int qcom_scm_qtee_invoke_smc(phys_addr_t inbuf, size_t inbuf_size,
 			     phys_addr_t outbuf, size_t outbuf_size,
-			     u64 *result, u64 *response_type);
+			     u64 *result, u64 *response_type, u64 *data);
 int qcom_scm_qtee_callback_response(phys_addr_t buf, size_t buf_size,
-				    u64 *result, u64 *response_type);
+				    u64 *result, u64 *response_type, u64 *data);
 
 #endif
