@@ -686,18 +686,28 @@ qcomtee_object_invoke_ctx_invoke(struct qcomtee_object_invoke_ctx *oic,
 	phys_addr_t out_msg_paddr;
 	phys_addr_t in_msg_paddr;
 	int ret;
-	u64 res;
+	u64 res, data = 0;
 
 	tee_shm_get_pa(oic->out_shm, 0, &out_msg_paddr);
 	tee_shm_get_pa(oic->in_shm, 0, &in_msg_paddr);
 	if (!(oic->flags & QCOMTEE_OIC_FLAG_BUSY))
 		ret = qcom_scm_qtee_invoke_smc(in_msg_paddr, oic->in_msg.size,
 					       out_msg_paddr, oic->out_msg.size,
-					       &res, res_type);
+					       &res, res_type, &data);
 	else
 		ret = qcom_scm_qtee_callback_response(out_msg_paddr,
 						      oic->out_msg.size,
-						      &res, res_type);
+						      &res, res_type, &data);
+
+	/* A legacy listener request (QSEOS incomplete or blocked) raised on the invocation */
+	if (!ret && (*res_type == QCOMTEE_RESULT_LISTENER_INCOMPLETE ||
+		     *res_type == QCOMTEE_RESULT_LISTENER_BLOCKED)) {
+		u64 lres[3] = { *res_type, res, data };
+
+		ret = qsee_bridge_qtee_listener(lres);
+		*res_type = lres[0];
+		res = lres[1];
+	}
 
 	if (ret)
 		pr_err("QTEE returned with %d.\n", ret);
@@ -767,6 +777,7 @@ int qcomtee_object_do_invoke_internal(struct qcomtee_object_invoke_ctx *oic,
 	/* Use input message buffer in 'oic'. */
 	cb_msg = oic->out_msg.addr;
 
+	qcom_scm_qtee_lock_acquire();
 	while (1) {
 		if (oic->flags & QCOMTEE_OIC_FLAG_BUSY) {
 			errno = oic->errno;
@@ -807,6 +818,7 @@ int qcomtee_object_do_invoke_internal(struct qcomtee_object_invoke_ctx *oic,
 			else
 				ret = -ENODEV;
 
+			qcom_scm_qtee_lock_release();
 			goto out;
 
 		} else {
@@ -841,6 +853,7 @@ int qcomtee_object_do_invoke_internal(struct qcomtee_object_invoke_ctx *oic,
 	}
 
 	qcomtee_fetch_async_reqs(oic);
+	qcom_scm_qtee_lock_release();
 out:
 	qcomtee_msg_buffers_free(oic);
 

@@ -108,6 +108,8 @@ union qcomtee_msg_arg {
 /* Response types as returned from qcomtee_object_invoke_ctx_invoke(). */
 
 /* The message contains a callback request. */
+#define QCOMTEE_RESULT_LISTENER_INCOMPLETE 1
+#define QCOMTEE_RESULT_LISTENER_BLOCKED 2
 #define QCOMTEE_RESULT_INBOUND_REQ_NEEDED 3
 
 /**
