@@ -6,7 +6,9 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/firmware/qcom/qcom_tzmem.h>
+#include <linux/dma-map-ops.h>
 #include <linux/mm.h>
+#include <linux/xarray.h>
 
 #include "qcomtee.h"
 
@@ -114,14 +116,89 @@ static int qcomtee_shm_unregister(struct tee_context *ctx, struct tee_shm *shm)
 	return 0;
 }
 
+/*
+ * QTEE needs physically contiguous memory: trusted application images are larger
+ * than the page allocator can hand out in one piece and multi-megabyte buffers
+ * rarely survive fragmentation, so take those from CMA.
+ */
+#define QCOMTEE_CMA_MIN_PAGES	(SZ_2M / PAGE_SIZE)
+
+/* Buffers taken from CMA, by page frame number */
+static DEFINE_XARRAY(qcomtee_cma_shms);
+
+static int qcomtee_shm_alloc_contig(struct tee_shm *shm, size_t nr_pages)
+{
+	struct page **pages;
+	struct page *page;
+	size_t i;
+	int rc;
+
+	page = dma_alloc_from_contiguous(NULL, nr_pages, 0, false);
+	if (!page)
+		return -ENOMEM;
+
+	pages = kcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages) {
+		rc = -ENOMEM;
+		goto err_release;
+	}
+	for (i = 0; i < nr_pages; i++)
+		pages[i] = page + i;
+
+	shm->kaddr = page_address(page);
+	shm->paddr = page_to_phys(page);
+	shm->size = nr_pages * PAGE_SIZE;
+	shm->pages = pages;
+	shm->num_pages = nr_pages;
+	memset(shm->kaddr, 0, shm->size);
+
+	rc = qcomtee_shm_register(shm->ctx, shm, pages, nr_pages, (unsigned long)shm->kaddr);
+	if (rc)
+		goto err_free;
+
+	rc = xa_err(xa_store(&qcomtee_cma_shms, page_to_pfn(page), xa_mk_value(1), GFP_KERNEL));
+	if (rc) {
+		qcomtee_shm_unregister(shm->ctx, shm);
+		goto err_free;
+	}
+
+	return 0;
+
+err_free:
+	kfree(pages);
+	shm->pages = NULL;
+	shm->kaddr = NULL;
+err_release:
+	dma_release_from_contiguous(NULL, page, nr_pages);
+	return rc;
+}
+
 static int pool_op_alloc(struct tee_shm_pool *pool, struct tee_shm *shm,
 			 size_t size, size_t align)
 {
+	size_t nr_pages = DIV_ROUND_UP(size, PAGE_SIZE);
+
+	if (nr_pages >= QCOMTEE_CMA_MIN_PAGES) {
+		int rc = qcomtee_shm_alloc_contig(shm, nr_pages);
+
+		if (rc != -ENOMEM || nr_pages > MAX_ORDER_NR_PAGES)
+			return rc;
+	}
+
 	return tee_dyn_shm_alloc_helper(shm, size, align, qcomtee_shm_register);
 }
 
 static void pool_op_free(struct tee_shm_pool *pool, struct tee_shm *shm)
 {
+	if (shm->kaddr && xa_erase(&qcomtee_cma_shms, page_to_pfn(virt_to_page(shm->kaddr)))) {
+		qcomtee_shm_unregister(shm->ctx, shm);
+		dma_release_from_contiguous(NULL, virt_to_page(shm->kaddr), shm->num_pages);
+		kfree(shm->pages);
+		shm->pages = NULL;
+		shm->kaddr = NULL;
+		return;
+	}
+
 	tee_dyn_shm_free_helper(shm, qcomtee_shm_unregister);
 }
 
