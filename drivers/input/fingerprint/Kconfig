@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config FINGERPRINT_GOODIX_FP
+	tristate "Goodix TEE fingerprint sensor control (/dev/goodix_fp)"
+	help
+	  Power, reset and interrupt control for Goodix fingerprint sensors whose
+	  data path runs in the Qualcomm TEE, as on the Nothing Phone (2).
