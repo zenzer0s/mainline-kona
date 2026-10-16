@@ -74,4 +74,12 @@ config QCOM_QSEECOM_UEFISECAPP
 	  Select Y here to provide access to EFI variables on the aforementioned
 	  platforms.
 
+config QCOM_QSEECOM_BRIDGE
+	tristate "Qualcomm QSEE app userspace bridge"
+	depends on QCOM_QSEECOM
+	help
+	  Exposes /dev/qseecom_bridge, letting userspace look up QSEE apps
+	  already running in the TrustZone and send them commands. Used on
+	  QTEE platforms for apps that are not reachable as QTEE objects.
+
 endmenu

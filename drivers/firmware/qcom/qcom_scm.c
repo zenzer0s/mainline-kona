@@ -302,6 +302,32 @@ found:
 	return qcom_scm_convention;
 }
 
+/*
+ * Other drivers' secure calls (the GPU sets its SMMU aperture on every resume) wait while
+ * a QSEE app call is suspended on a listener. Inline crypto key
+ * programming is exempt: the listeners' own file I/O may need it.
+ */
+static DECLARE_RWSEM(qcom_scm_qsee_rwsem);
+
+void qcom_scm_qsee_block(void)
+{
+	down_write(&qcom_scm_qsee_rwsem);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qsee_block);
+
+void qcom_scm_qsee_unblock(void)
+{
+	up_write(&qcom_scm_qsee_rwsem);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qsee_unblock);
+
+static bool qcom_scm_waits_for_qsee(const struct qcom_scm_desc *desc)
+{
+	return desc->owner != ARM_SMCCC_OWNER_TRUSTED_APP &&
+	       desc->owner != ARM_SMCCC_OWNER_TRUSTED_OS &&
+	       desc->svc != QCOM_SCM_SVC_ES;
+}
+
 /**
  * qcom_scm_call() - Invoke a syscall in the secure world
  * @dev:	device
@@ -314,17 +340,27 @@ found:
 static int qcom_scm_call(struct device *dev, const struct qcom_scm_desc *desc,
 			 struct qcom_scm_res *res)
 {
+	bool wait = qcom_scm_waits_for_qsee(desc);
+	int ret;
+
 	might_sleep();
+	if (wait)
+		down_read(&qcom_scm_qsee_rwsem);
 	switch (__get_convention()) {
 	case SMC_CONVENTION_ARM_32:
 	case SMC_CONVENTION_ARM_64:
-		return scm_smc_call(dev, desc, res, false);
+		ret = scm_smc_call(dev, desc, res, false);
+		break;
 	case SMC_CONVENTION_LEGACY:
-		return scm_legacy_call(dev, desc, res);
+		ret = scm_legacy_call(dev, desc, res);
+		break;
 	default:
 		pr_err("Unknown current SCM calling convention.\n");
-		return -EINVAL;
+		ret = -EINVAL;
 	}
+	if (wait)
+		up_read(&qcom_scm_qsee_rwsem);
+	return ret;
 }
 
 /**
@@ -2282,6 +2318,48 @@ int qcom_scm_qseecom_app_send(u32 app_id, void *req, size_t req_size,
 }
 EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_send);
 
+/**
+ * qcom_scm_qseecom_call_raw() - Perform a QSEECOM SCM call as given.
+ * @owner:   SMC owner.
+ * @svc:     SMC service.
+ * @cmd:     SMC command.
+ * @arginfo: Argument info, see QCOM_SCM_ARGS().
+ * @args:    Arguments.
+ * @nargs:   Number of arguments.
+ * @res:     Result, response type and data returned by the TrustZone.
+ *
+ * For callers that drive the QSEE app and listener protocol themselves,
+ * including incomplete and blocked calls.
+ *
+ * Return: Zero on success, nonzero if the SCM call itself failed.
+ */
+int qcom_scm_qseecom_call_raw(u32 owner, u32 svc, u32 cmd, u32 arginfo,
+			      const u64 *args, unsigned int nargs, u64 res[3])
+{
+	struct qcom_scm_qseecom_resp resp = {};
+	struct qcom_scm_desc desc = {
+		.owner = owner,
+		.svc = svc,
+		.cmd = cmd,
+		.arginfo = arginfo,
+	};
+	int ret;
+
+	if (nargs > ARRAY_SIZE(desc.args))
+		return -EINVAL;
+	memcpy(desc.args, args, nargs * sizeof(*args));
+
+	mutex_lock(&qcom_scm_qseecom_call_lock);
+	ret = __qcom_scm_qseecom_call(&desc, &resp);
+	mutex_unlock(&qcom_scm_qseecom_call_lock);
+
+	res[0] = resp.result;
+	res[1] = resp.resp_type;
+	res[2] = resp.data;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_call_raw);
+
 /*
  * We do not yet support re-entrant calls via the qseecom interface. To prevent
  + any potential issues with this, only allow validated machines for now.
@@ -2387,6 +2465,24 @@ static int qcom_scm_qseecom_init(struct qcom_scm *scm)
 
 #endif /* CONFIG_QCOM_QSEECOM */
 
+/*
+ * Serializes QTEE invocations, callbacks included, with legacy QSEE app calls and their
+ * listener round trips.
+ */
+static DEFINE_MUTEX(qcom_scm_qtee_lock);
+
+void qcom_scm_qtee_lock_acquire(void)
+{
+	mutex_lock(&qcom_scm_qtee_lock);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qtee_lock_acquire);
+
+void qcom_scm_qtee_lock_release(void)
+{
+	mutex_unlock(&qcom_scm_qtee_lock);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qtee_lock_release);
+
 /**
  * qcom_scm_qtee_invoke_smc() - Invoke a QTEE object.
  * @inbuf: start address of memory area used for inbound buffer.
@@ -2403,7 +2499,7 @@ static int qcom_scm_qseecom_init(struct qcom_scm *scm)
  */
 int qcom_scm_qtee_invoke_smc(phys_addr_t inbuf, size_t inbuf_size,
 			     phys_addr_t outbuf, size_t outbuf_size,
-			     u64 *result, u64 *response_type)
+			     u64 *result, u64 *response_type, u64 *data)
 {
 	struct qcom_scm_desc desc = {
 		.svc = QCOM_SCM_SVC_SMCINVOKE,
@@ -2429,6 +2525,9 @@ int qcom_scm_qtee_invoke_smc(phys_addr_t inbuf, size_t inbuf_size,
 	if (result)
 		*result = res.result[1];
 
+	if (data)
+		*data = res.result[2];
+
 	return 0;
 }
 EXPORT_SYMBOL(qcom_scm_qtee_invoke_smc);
@@ -2445,7 +2544,7 @@ EXPORT_SYMBOL(qcom_scm_qtee_invoke_smc);
  * Return: On success, return 0 or <0 on failure.
  */
 int qcom_scm_qtee_callback_response(phys_addr_t buf, size_t buf_size,
-				    u64 *result, u64 *response_type)
+				    u64 *result, u64 *response_type, u64 *data)
 {
 	struct qcom_scm_desc desc = {
 		.svc = QCOM_SCM_SVC_SMCINVOKE,
@@ -2467,6 +2566,9 @@ int qcom_scm_qtee_callback_response(phys_addr_t buf, size_t buf_size,
 
 	if (result)
 		*result = res.result[1];
+
+	if (data)
+		*data = res.result[2];
 
 	return 0;
 }
@@ -2540,7 +2642,7 @@ static void qcom_scm_qtee_init(struct qcom_scm *scm)
 	 * but first, it checks whether the call is supported in QTEE syscall
 	 * handler. If it is not supported, -EIO is returned.
 	 */
-	ret = qcom_scm_qtee_invoke_smc(0, 0, 0, 0, &result, &response_type);
+	ret = qcom_scm_qtee_invoke_smc(0, 0, 0, 0, &result, &response_type, NULL);
 	if (ret == -EIO)
 		return;
 
