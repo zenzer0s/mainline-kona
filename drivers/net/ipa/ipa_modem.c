@@ -209,10 +209,96 @@ void ipa_modem_skb_rx(struct net_device *netdev, struct sk_buff *skb)
 	}
 }
 
+#define RMNET_IOCTL_EXTENDED			0x89fd
+
+#define RMNET_IOCTL_GET_SUPPORTED_FEATURES	0x0000
+#define RMNET_IOCTL_GET_MRU			0x0002
+#define RMNET_IOCTL_GET_EPID			0x0003
+#define RMNET_IOCTL_GET_DRIVER_NAME		0x0004
+#define RMNET_IOCTL_GET_EP_PAIR			0x0010
+#define RMNET_IOCTL_GET_SG_SUPPORT		0x0017
+#define RMNET_IOCTL_GET_EPID_LL			0x0021
+#define RMNET_IOCTL_GET_EP_PAIR_LL		0x0022
+
+#define RMNET_IOCTL_FEAT_NOTIFY_MUX_CHANNEL	BIT(0)
+#define RMNET_IOCTL_FEAT_SET_EGRESS_DATA_FORMAT	BIT(1)
+#define RMNET_IOCTL_FEAT_SET_INGRESS_DATA_FORMAT BIT(2)
+
+struct rmnet_ioctl_extended {
+	__u32 extended_ioctl;
+	union {
+		__u32 data;
+		char if_name[IFNAMSIZ];
+		struct {
+			__u32 consumer_pipe_num;
+			__u32 producer_pipe_num;
+		} ipa_ep_pair;
+		__u8 raw[20];
+	} u;
+};
+
+static int ipa_rmnet_ioctl_extended(struct net_device *netdev,
+				    void __user *data)
+{
+	struct ipa_priv *priv = netdev_priv(netdev);
+	struct rmnet_ioctl_extended ext;
+
+	if (copy_from_user(&ext, data, sizeof(ext)))
+		return -EFAULT;
+
+	switch (ext.extended_ioctl) {
+	case RMNET_IOCTL_GET_SUPPORTED_FEATURES:
+		ext.u.data = RMNET_IOCTL_FEAT_NOTIFY_MUX_CHANNEL |
+			     RMNET_IOCTL_FEAT_SET_EGRESS_DATA_FORMAT |
+			     RMNET_IOCTL_FEAT_SET_INGRESS_DATA_FORMAT;
+		break;
+	case RMNET_IOCTL_GET_MRU:
+		ext.u.data = netdev->mtu;
+		break;
+	case RMNET_IOCTL_GET_EPID:
+		ext.u.data = 1;
+		break;
+	case RMNET_IOCTL_GET_DRIVER_NAME:
+		strscpy(ext.u.if_name, netdev->name, IFNAMSIZ);
+		break;
+	case RMNET_IOCTL_GET_EP_PAIR:
+		ext.u.ipa_ep_pair.consumer_pipe_num = priv->tx->endpoint_id;
+		ext.u.ipa_ep_pair.producer_pipe_num = priv->rx->endpoint_id;
+		break;
+	case RMNET_IOCTL_GET_SG_SUPPORT:
+		ext.u.data = 0;
+		break;
+	case RMNET_IOCTL_GET_EPID_LL:
+	case RMNET_IOCTL_GET_EP_PAIR_LL:
+		return -EOPNOTSUPP;
+	default:
+		netdev_dbg(netdev, "rmnet ioctl 0x%x data 0x%x\n",
+			    ext.extended_ioctl, ext.u.data);
+		return 0;
+	}
+
+	netdev_dbg(netdev, "rmnet ioctl 0x%x -> 0x%x\n",
+		    ext.extended_ioctl, ext.u.data);
+
+	return copy_to_user(data, &ext, sizeof(ext)) ? -EFAULT : 0;
+}
+
+static int ipa_siocdevprivate(struct net_device *netdev, struct ifreq *ifr,
+			      void __user *data, int cmd)
+{
+	if (cmd == RMNET_IOCTL_EXTENDED)
+		return ipa_rmnet_ioctl_extended(netdev, data);
+
+	netdev_dbg(netdev, "rmnet private ioctl 0x%x\n", cmd);
+
+	return 0;
+}
+
 static const struct net_device_ops ipa_modem_ops = {
-	.ndo_open	= ipa_open,
-	.ndo_stop	= ipa_stop,
-	.ndo_start_xmit	= ipa_start_xmit,
+	.ndo_open		= ipa_open,
+	.ndo_stop		= ipa_stop,
+	.ndo_start_xmit		= ipa_start_xmit,
+	.ndo_siocdevprivate	= ipa_siocdevprivate,
 };
 
 /** ipa_modem_netdev_setup() - netdev setup function for the modem */
