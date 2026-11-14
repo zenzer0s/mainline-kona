@@ -120,7 +120,7 @@ int drm_sysfb_plane_helper_get_scanout_buffer(struct drm_plane *plane,
 					      struct drm_scanout_buffer *sb);
 
 #define DRM_SYSFB_PLANE_NFORMATS(_num_native) \
-	((_num_native) + 1)
+	((_num_native) + 16)
 
 #define DRM_SYSFB_PLANE_FORMAT_MODIFIERS \
 	DRM_FORMAT_MOD_LINEAR, \

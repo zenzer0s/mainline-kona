@@ -128,6 +128,12 @@ size_t drm_sysfb_build_fourcc_list(struct drm_device *dev,
 	 */
 	static const u32 extra_fourccs[] = {
 		DRM_FORMAT_XRGB8888,
+		DRM_FORMAT_ARGB8888,
+		DRM_FORMAT_RGB565,
+		DRM_FORMAT_XBGR8888,
+		DRM_FORMAT_ABGR8888,
+		DRM_FORMAT_RGBA8888,
+		DRM_FORMAT_BGRA8888,
 	};
 	static const size_t extra_nfourccs = ARRAY_SIZE(extra_fourccs);
 
@@ -232,6 +238,12 @@ static drm_sysfb_blit_func drm_sysfb_get_blit_func(u32 dst_format, u32 src_forma
 			return drm_fb_xrgb8888_to_bgrx8888;
 		case DRM_FORMAT_RGB332:
 			return drm_fb_xrgb8888_to_rgb332;
+		}
+	} else if (src_format == DRM_FORMAT_ARGB8888) {
+		switch (dst_format) {
+		case DRM_FORMAT_XRGB8888:
+		case DRM_FORMAT_ARGB8888:
+			return drm_sysfb_memcpy;
 		}
 	}
 
