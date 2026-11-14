@@ -107,9 +107,8 @@
 
 	qca6390_pmu: qca6390-pmu {
 		compatible = "qcom,qca6390-pmu";
+		pinctrl-names = "default";
 		pinctrl-0 = <&bt_en_default>, <&wlan_en_default>;
-		pinctrl-1 = <&bt_en_suspend>, <&wlan_en_suspend>;
-		pinctrl-names = "default", "sleep";
 		vddaon-supply = <&vreg_s6a_0p95>;
 		vddpmu-supply = <&vreg_s2f_0p95>;
 		vddrfa0p95-supply = <&vreg_s2f_0p95>;
@@ -162,23 +161,6 @@
 				regulator-name = "vreg_pmu_pcie_1p8";
 			};
 		};
-	};
-
-	qca639x: qca639x {
-		compatible = "qcom,qca6390";
-		#power-domain-cells = <0>;
-		vddaon-supply = <&vreg_s6a_0p95>;
-		vddpmu-supply = <&vreg_s2f_0p95>;
-		vddrfa1-supply = <&vreg_s2f_0p95>;
-		vddrfa2-supply = <&vreg_s8c_1p3>;
-		vddrfa3-supply = <&vreg_s5a_1p9>;
-		vddpcie1-supply = <&vreg_s8c_1p3>;
-		vddpcie2-supply = <&vreg_s5a_1p9>;
-		vddio-supply = <&vreg_s4a_1p8>;
-		pinctrl-0 = <&wlan_en_default>;
-		pinctrl-1 = <&wlan_en_suspend>;
-		pinctrl-names = "default", "sleep";
-		wlan-en-gpios = <&tlmm 20 GPIO_ACTIVE_HIGH>;
 	};
 
 	reserved-memory {
@@ -1420,8 +1402,6 @@
 
 	bluetooth {
 		compatible = "qcom,qca6390-bt";
-		enable-gpios = <&tlmm 21 GPIO_ACTIVE_HIGH>;
-		swctrl-gpios = <&tlmm 124 GPIO_ACTIVE_HIGH>;
 		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
 		vddaon-supply = <&vreg_pmu_aon_0p59>;
 		vddbtcmx-supply = <&vreg_pmu_btcmx_0p85>;
