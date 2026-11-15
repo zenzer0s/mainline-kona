@@ -10,8 +10,11 @@
 
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/firmware.h>
+#include <linux/iommu.h>
 #include <linux/mhi.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
 #include <linux/timer.h>
@@ -566,6 +569,58 @@ static const struct mhi_pci_dev_info mhi_foxconn_sdx55_info = {
 	.sideband_wake = false,
 };
 
+/*
+ * OnePlus 8T (kebab): flashless SDX55 on PCIe2. It reports the Qualcomm
+ * reference subsystem ID (17cb:010c) and so matches the Foxconn entry, but
+ * nothing is in its flash: SBL goes over BHI, everything else over Sahara
+ * (sahara_mdm), from the stock modem partition (firmware_class.path).
+ */
+static const struct mhi_channel_config mhi_oneplus_sdx55_channels[] = {
+	MHI_CHANNEL_CONFIG_UL(0, "LOOPBACK", 32, 0),
+	MHI_CHANNEL_CONFIG_DL(1, "LOOPBACK", 32, 0),
+	MHI_CHANNEL_CONFIG_UL_SBL(2, "SAHARA", 128, 1),
+	MHI_CHANNEL_CONFIG_DL_SBL(3, "SAHARA", 128, 1),
+	MHI_CHANNEL_CONFIG_UL(4, "DIAG", 32, 1),
+	MHI_CHANNEL_CONFIG_DL(5, "DIAG", 32, 1),
+	/* remote EFS sync (Sahara memory debug), served by sahara_mdm */
+	MHI_CHANNEL_CONFIG_UL(10, "EFS", 32, 0),
+	MHI_CHANNEL_CONFIG_DL(11, "EFS", 32, 0),
+	MHI_CHANNEL_CONFIG_UL(14, "QMI", 32, 0),
+	MHI_CHANNEL_CONFIG_DL(15, "QMI", 32, 0),
+	MHI_CHANNEL_CONFIG_UL(20, "IPCR", 32, 0),
+	MHI_CHANNEL_CONFIG_DL(21, "IPCR", 32, 0),
+	MHI_CHANNEL_CONFIG_UL(32, "DUN", 32, 0),
+	MHI_CHANNEL_CONFIG_DL(33, "DUN", 32, 0),
+	MHI_CHANNEL_CONFIG_HW_UL(100, "IP_HW0", 128, 2),
+	MHI_CHANNEL_CONFIG_HW_DL(101, "IP_HW0", 128, 3),
+};
+
+static const struct mhi_controller_config modem_oneplus_sdx55_config = {
+	.max_channels = 128,
+	.timeout_ms = 20000,
+	.num_channels = ARRAY_SIZE(mhi_oneplus_sdx55_channels),
+	.ch_cfg = mhi_oneplus_sdx55_channels,
+	.num_events = ARRAY_SIZE(mhi_foxconn_sdx55_events),
+	.event_cfg = mhi_foxconn_sdx55_events,
+};
+
+static const struct mhi_pci_dev_info mhi_oneplus_sdx55_info = {
+	.name = "oneplus-sdx55",
+	.fw = "sdx55m/sbl1.mbn",
+	.edl_trigger = false,
+	.config = &modem_oneplus_sdx55_config,
+	.bar_num = MHI_PCI_DEFAULT_BAR_NUM,
+	/*
+	 * Downstream gives the X55 a 1 GB host window (MHI ctrl/data limit
+	 * 0x3fffffff, IOVA pool 0x20000000-0x3fffffff); SBL took a system
+	 * error right after we programmed a 4 GB one.
+	 */
+	.dma_data_width = 30,
+	.mru_default = 32768,
+	.sideband_wake = false,
+	.no_m3 = true,
+};
+
 static const struct mhi_pci_dev_info mhi_foxconn_t99w175_info = {
 	.name = "foxconn-t99w175",
 	.edl = "qcom/sdx55m/foxconn/prog_firehose_sdx55.mbn",
@@ -1094,7 +1149,154 @@ struct mhi_pci_device {
 	struct timer_list health_check_timer;
 	unsigned long status;
 	bool reset_on_remove;
+	/* bring-up: periodic dump of a flashless modem's boot progress */
+	struct delayed_work boot_dbg_work;
+	unsigned int boot_dbg_left;
+	/* flashless modem: power up only once its SBL is readable */
+	struct delayed_work fw_wait_work;
+	unsigned int fw_wait_left;
+	bool fw_waiting;
+	bool fw_seen;
+	/* kebab SDX55: some MSIs are lost, so also poll the MHI vectors */
+	struct delayed_work poll_work;
+	bool poll_irqs;
+	/* scratch page mapped at the MSI address in the device's IOMMU domain */
+	struct page *msi_sink;
+	unsigned long msi_sink_iova;
 };
+
+/*
+ * Some of the X55's MSIs (in SBL) are not terminated by the DWC iMSI-RX and
+ * reach the SMMU, where they fault; the downstream host mapped its MSI
+ * doorbell for the device. Map a scratch page there so such writes complete
+ * normally (the interrupt is still picked up by polling).
+ */
+static void mhi_pci_map_msi_sink(struct mhi_pci_device *mhi_pdev, struct pci_dev *pdev)
+{
+	struct iommu_domain *dom = iommu_get_domain_for_dev(&pdev->dev);
+	u32 lo = 0, hi = 0;
+	unsigned long iova;
+	int ret;
+
+	if (!dom || !pdev->msi_cap)
+		return;
+
+	pci_read_config_dword(pdev, pdev->msi_cap + PCI_MSI_ADDRESS_LO, &lo);
+	pci_read_config_dword(pdev, pdev->msi_cap + PCI_MSI_ADDRESS_HI, &hi);
+	iova = (unsigned long)(((u64)hi << 32 | lo) & PAGE_MASK);
+	if (!iova)
+		return;
+
+	mhi_pdev->msi_sink = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!mhi_pdev->msi_sink)
+		return;
+
+	ret = iommu_map(dom, iova, page_to_phys(mhi_pdev->msi_sink), PAGE_SIZE,
+			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+	if (ret) {
+		dev_warn(&pdev->dev, "cannot map MSI sink at %#lx: %d\n", iova, ret);
+		__free_page(mhi_pdev->msi_sink);
+		mhi_pdev->msi_sink = NULL;
+		return;
+	}
+
+	mhi_pdev->msi_sink_iova = iova;
+	dev_info(&pdev->dev, "MSI sink page mapped at iova %#lx\n", iova);
+}
+
+static void mhi_pci_unmap_msi_sink(struct mhi_pci_device *mhi_pdev, struct pci_dev *pdev)
+{
+	struct iommu_domain *dom = iommu_get_domain_for_dev(&pdev->dev);
+
+	if (!mhi_pdev->msi_sink)
+		return;
+	if (dom)
+		iommu_unmap(dom, mhi_pdev->msi_sink_iova, PAGE_SIZE);
+	__free_page(mhi_pdev->msi_sink);
+	mhi_pdev->msi_sink = NULL;
+}
+
+static void mhi_pci_poll(struct work_struct *work)
+{
+	struct mhi_pci_device *mhi_pdev = container_of(to_delayed_work(work),
+						       struct mhi_pci_device, poll_work);
+
+	if (!test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) || !mhi_pdev->mhi_cntrl.bhi)
+		return;
+
+	mhi_poll_irqs(&mhi_pdev->mhi_cntrl);
+	queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
+}
+
+static void mhi_pci_start(struct mhi_pci_device *mhi_pdev);
+
+static void mhi_pci_fw_wait(struct work_struct *work)
+{
+	struct mhi_pci_device *mhi_pdev = container_of(to_delayed_work(work),
+						       struct mhi_pci_device, fw_wait_work);
+	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
+	struct device *dev = mhi_cntrl->cntrl_dev;
+	const struct firmware *fw;
+
+	/* no sysfs fallback: that blocks for 60 s per try before /vendor is up */
+	if (request_firmware_direct(&fw, mhi_cntrl->fw_image, dev)) {
+		if (--mhi_pdev->fw_wait_left) {
+			schedule_delayed_work(&mhi_pdev->fw_wait_work, HZ / 2);
+			return;
+		}
+		dev_err(dev, "%s never became readable, giving up\n", mhi_cntrl->fw_image);
+		return;
+	}
+	release_firmware(fw);
+
+	/* let init's post-fs (firmware path, rebinds) settle before starting */
+	if (!mhi_pdev->fw_seen) {
+		mhi_pdev->fw_seen = true;
+		schedule_delayed_work(&mhi_pdev->fw_wait_work, 3 * HZ);
+		return;
+	}
+
+	dev_info(dev, "%s readable, powering up (device ee %d)\n",
+		 mhi_cntrl->fw_image, mhi_get_exec_env(mhi_cntrl));
+	if (mhi_async_power_up(mhi_cntrl)) {
+		dev_err(dev, "failed to power up MHI controller\n");
+		return;
+	}
+	mhi_pdev->fw_waiting = false;
+	mhi_pci_start(mhi_pdev);
+}
+
+static void mhi_pci_boot_dbg(struct work_struct *work)
+{
+	struct mhi_pci_device *mhi_pdev = container_of(to_delayed_work(work),
+						       struct mhi_pci_device, boot_dbg_work);
+	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
+	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
+	u16 cmd = 0, sta = 0, mctl = 0;
+	u32 alo = 0, ahi = 0, data = 0;
+
+	/* the controller may have been torn down by a failed recovery */
+	if (!test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) || !mhi_cntrl->bhi)
+		return;
+
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	pci_read_config_word(pdev, PCI_STATUS, &sta);
+	if (pdev->msi_cap) {
+		pci_read_config_word(pdev, pdev->msi_cap + PCI_MSI_FLAGS, &mctl);
+		pci_read_config_dword(pdev, pdev->msi_cap + PCI_MSI_ADDRESS_LO, &alo);
+		pci_read_config_dword(pdev, pdev->msi_cap + PCI_MSI_ADDRESS_HI, &ahi);
+		pci_read_config_dword(pdev, pdev->msi_cap + PCI_MSI_DATA_64, &data);
+	}
+
+	dev_info(&pdev->dev,
+		 "boot-dbg: mhi state %d ee %d (host ee %d) [ee 0=PBL 1=SBL 2=AMSS] cmd %#x sta %#x msi ctl %#x addr %#x:%08x data %#x irqs %d\n",
+		 mhi_get_mhi_state(mhi_cntrl), mhi_get_exec_env(mhi_cntrl),
+		 mhi_cntrl->ee, cmd, sta, mctl, ahi, alo, data,
+		 mhi_cntrl->nr_irqs);
+
+	if (--mhi_pdev->boot_dbg_left)
+		schedule_delayed_work(&mhi_pdev->boot_dbg_work, 5 * HZ);
+}
 
 static int mhi_pci_read_reg(struct mhi_controller *mhi_cntrl,
 			    void __iomem *addr, u32 *out)
@@ -1122,6 +1324,13 @@ static void mhi_pci_status_cb(struct mhi_controller *mhi_cntrl,
 		pm_runtime_forbid(&pdev->dev);
 		break;
 	case MHI_CB_EE_MISSION_MODE:
+		/* downstream mhi,sfr-support: have the X55 report its crash reason */
+		if (of_machine_is_compatible("oneplus,kebab")) {
+			int ret = mhi_setup_sfr(mhi_cntrl, 256);
+
+			if (ret)
+				dev_warn(&pdev->dev, "SFR setup failed: %d\n", ret);
+		}
 		pm_runtime_allow(&pdev->dev);
 		break;
 	default:
@@ -1261,6 +1470,8 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 
 	dev_warn(&pdev->dev, "device recovery started\n");
 
+	cancel_delayed_work_sync(&mhi_pdev->poll_work);
+
 	if (!pdev->is_virtfn)
 		timer_delete(&mhi_pdev->health_check_timer);
 
@@ -1290,6 +1501,8 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 	dev_dbg(&pdev->dev, "Recovery completed\n");
 
 	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
+	if (mhi_pdev->poll_irqs)
+		queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
 
 	if (!pdev->is_virtfn)
 		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
@@ -1358,6 +1571,25 @@ err_get_chdb:
 	return ret;
 }
 
+static void mhi_pci_start(struct mhi_pci_device *mhi_pdev)
+{
+	struct pci_dev *pdev = to_pci_dev(mhi_pdev->mhi_cntrl.cntrl_dev);
+
+	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
+
+	if (mhi_pdev->poll_irqs)
+		queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
+
+	if (mhi_pdev->fw_wait_left) {
+		mhi_pdev->boot_dbg_left = 12;
+		schedule_delayed_work(&mhi_pdev->boot_dbg_work, HZ);
+	}
+
+	/* start health check */
+	if (!pdev->is_virtfn)
+		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
+}
+
 static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	const struct mhi_pci_dev_info *info = (struct mhi_pci_dev_info *) id->driver_data;
@@ -1367,6 +1599,9 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	unsigned int dma_data_width;
 	int err;
 
+	if (info == &mhi_foxconn_sdx55_info && of_machine_is_compatible("oneplus,kebab"))
+		info = &mhi_oneplus_sdx55_info;
+
 	dev_info(&pdev->dev, "MHI PCI device found: %s\n", info->name);
 
 	/* mhi_pdev.mhi_cntrl must be zero-initialized */
@@ -1375,6 +1610,9 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -ENOMEM;
 
 	INIT_WORK(&mhi_pdev->recovery_work, mhi_pci_recovery_work);
+	INIT_DELAYED_WORK(&mhi_pdev->boot_dbg_work, mhi_pci_boot_dbg);
+	INIT_DELAYED_WORK(&mhi_pdev->fw_wait_work, mhi_pci_fw_wait);
+	INIT_DELAYED_WORK(&mhi_pdev->poll_work, mhi_pci_poll);
 
 	if (pdev->is_virtfn && info->vf_config)
 		mhi_cntrl_config = info->vf_config;
@@ -1444,17 +1682,27 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_unregister;
 	}
 
+	/*
+	 * A flashless modem needs its SBL from /vendor, which isn't mounted
+	 * when PCI probes at boot: stay bound and power up from a work item
+	 * once the image is readable, so nothing in init has to time it.
+	 */
+	if (info == &mhi_oneplus_sdx55_info) {
+		mhi_pci_map_msi_sink(mhi_pdev, pdev);
+		mhi_pdev->poll_irqs = true;
+		mhi_pdev->fw_waiting = true;
+		mhi_pdev->fw_wait_left = 240;	/* 2 min, every 500 ms */
+		schedule_delayed_work(&mhi_pdev->fw_wait_work, 0);
+		return 0;
+	}
+
 	err = mhi_async_power_up(mhi_cntrl);
 	if (err) {
 		dev_err(&pdev->dev, "failed to power up MHI controller\n");
 		goto err_unprepare;
 	}
 
-	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
-
-	/* start health check */
-	if (!pdev->is_virtfn)
-		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
+	mhi_pci_start(mhi_pdev);
 
 	/* Allow runtime suspend only if both PME from D3Hot and M3 are supported */
 	if (pci_pme_capable(pdev, PCI_D3hot) && !(info->no_m3)) {
@@ -1485,6 +1733,12 @@ static void mhi_pci_remove(struct pci_dev *pdev)
 	if (!pdev->is_virtfn)
 		timer_delete_sync(&mhi_pdev->health_check_timer);
 	cancel_work_sync(&mhi_pdev->recovery_work);
+	cancel_delayed_work_sync(&mhi_pdev->fw_wait_work);
+	cancel_delayed_work_sync(&mhi_pdev->poll_work);
+	cancel_delayed_work_sync(&mhi_pdev->boot_dbg_work);
+	mhi_pci_unmap_msi_sink(mhi_pdev, pdev);
+	if (mhi_pdev->fw_waiting)
+		mhi_unprepare_after_power_down(mhi_cntrl);
 
 	if (test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
 		mhi_power_down(mhi_cntrl, true);

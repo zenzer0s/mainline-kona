@@ -367,8 +367,10 @@ int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
 	 * address if it's a 32-bit address. Otherwise, try 32-bit and 64-bit
 	 * coherent memory allocation one by one.
 	 */
-	if (!(pp->cfg0_base & GENMASK_ULL(63, 32))) {
+	if (!(pp->cfg0_base & GENMASK_ULL(63, 32)) &&
+	    !of_property_read_bool(dev->of_node, "snps,msi-target-in-ram")) {
 		pp->msi_data = pp->cfg0_base;
+		dev_info(dev, "iMSI-RX target %pad (config region)\n", &pp->msi_data);
 		return 0;
 	}
 
@@ -389,6 +391,7 @@ int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
 		}
 	}
 
+	dev_info(dev, "iMSI-RX target %pad (RAM)\n", &pp->msi_data);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(dw_pcie_msi_host_init);
