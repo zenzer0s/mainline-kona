@@ -360,6 +360,12 @@ int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
 	 * done by allocating from the artificially limited DMA-coherent
 	 * memory.
 	 */
+	if (!(pp->cfg0_base & GENMASK_ULL(63, 32)) &&
+	    !of_property_read_bool(dev->of_node, "snps,msi-target-in-ram")) {
+		pp->msi_data = pp->cfg0_base;
+		dev_info(dev, "iMSI-RX target %pad (config region)\n", &pp->msi_data);
+		return 0;
+	}
 	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
 	if (!ret)
 		msi_vaddr = dmam_alloc_coherent(dev, sizeof(u64), &pp->msi_data,
@@ -377,6 +383,7 @@ int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
 		}
 	}
 
+	dev_info(dev, "iMSI-RX target %pad (RAM)\n", &pp->msi_data);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(dw_pcie_msi_host_init);
