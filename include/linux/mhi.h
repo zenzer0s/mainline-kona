@@ -462,6 +462,17 @@ struct mhi_controller {
 	bool wake_set;
 	unsigned long irq_flags;
 	u32 mru;
+
+	/* bring-up: last state/EE logged by the intvec handler */
+	enum mhi_state dbg_last_state;
+	enum mhi_ee_type dbg_last_ee;
+	enum mhi_ee_type dbg_ee_queued;
+
+	/* QTI subsystem failure reason (crash string) buffer, as downstream */
+	char *sfr_buf;
+	dma_addr_t sfr_dma;
+	size_t sfr_len;
+	bool sfr_printed;
 };
 
 /**
@@ -795,5 +806,14 @@ bool mhi_queue_is_full(struct mhi_device *mhi_dev, enum dma_data_direction dir);
  * Return: 0 if the read succeeds, a negative error code otherwise
  */
 int mhi_get_channel_doorbell_offset(struct mhi_controller *mhi_cntrl, u32 *chdb_offset);
+
+/**
+ * mhi_poll_irqs - Run the MHI interrupt handlers without an interrupt
+ * @mhi_cntrl: MHI controller
+ */
+void mhi_poll_irqs(struct mhi_controller *mhi_cntrl);
+
+/* Hand the device a buffer for its crash reason string (QTI SFR_CFG) */
+int mhi_setup_sfr(struct mhi_controller *mhi_cntrl, size_t len);
 
 #endif /* _MHI_H_ */
