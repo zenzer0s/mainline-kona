@@ -29,3 +29,14 @@ config MHI_BUS_PCI_GENERIC
 	  This driver provides MHI PCI controller driver for devices such as
 	  Qualcomm SDX55 based PCIe modems.
 
+
+config MHI_BUS_SAHARA_MDM
+	tristate "Sahara image loader for flashless MHI modems"
+	depends on MHI_BUS
+	depends on BLOCK
+	select WANT_DEV_COREDUMP
+	help
+	  Serves boot images over the MHI SAHARA channel to flashless
+	  external modems such as the SDX55 on the OnePlus 8T, after the MHI
+	  core has pushed SBL over BHI. Images come from the firmware loader
+	  or from raw EFS/DDR partitions.
