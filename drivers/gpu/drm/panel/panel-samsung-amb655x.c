@@ -45,7 +45,7 @@ static int amb655x_get_current_mode(struct amb655x *ctx)
 	struct drm_crtc_state *crtc_state;
 	struct drm_display_mode *mode;
 
-	if (!connector || !connector->state)
+	if (!connector || !connector->state || !connector->state->crtc)
 		return -ENODEV;
 
 	crtc_state = connector->state->crtc->state;
@@ -301,7 +301,15 @@ static const struct drm_display_mode amb655x_60_mode = {
 static int amb655x_get_modes(struct drm_panel *panel,
 			     struct drm_connector *connector)
 {
+	struct amb655x *ctx = to_amb655x(panel);
 	int count = 0;
+
+	/*
+	 * amb655x_on() picks the panel's internal 60/120 Hz setting (0x60)
+	 * from the mode on this connector; without it the panel was always
+	 * told 60 Hz while DSI sent 120 Hz timings.
+	 */
+	ctx->connector = connector;
 
 	/* Initialize 120Hz first */
 	count += drm_connector_helper_get_modes_fixed(connector, &amb655x_120_mode);
