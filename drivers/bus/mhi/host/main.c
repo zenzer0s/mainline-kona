@@ -502,8 +502,29 @@ irqreturn_t mhi_intvec_threaded_handler(int irq_number, void *priv)
 	ee = mhi_get_exec_env(mhi_cntrl);
 
 	trace_mhi_intvec_states(mhi_cntrl, ee, state);
+	if (state != mhi_cntrl->dbg_last_state || ee != mhi_cntrl->dbg_last_ee) {
+		mhi_cntrl->dbg_last_state = state;
+		mhi_cntrl->dbg_last_ee = ee;
+		dev_info(dev, "intvec: state %s ee %s\n",
+			 mhi_state_str(state), TO_MHI_EXEC_STR(ee));
+	}
 	if (state == MHI_STATE_SYS_ERR) {
-		dev_dbg(dev, "System error detected\n");
+		u32 code = 0, d1 = 0, d2 = 0, d3 = 0;
+
+		/* bring-up: grab the device's error registers before it resets */
+		if (mhi_cntrl->bhi) {
+			mhi_cntrl->read_reg(mhi_cntrl, mhi_cntrl->bhi + BHI_ERRCODE, &code);
+			mhi_cntrl->read_reg(mhi_cntrl, mhi_cntrl->bhi + BHI_ERRDBG1, &d1);
+			mhi_cntrl->read_reg(mhi_cntrl, mhi_cntrl->bhi + BHI_ERRDBG2, &d2);
+			mhi_cntrl->read_reg(mhi_cntrl, mhi_cntrl->bhi + BHI_ERRDBG3, &d3);
+		}
+		dev_err(dev, "System error detected (ee %s): ERRCODE %#x DBG1 %#x DBG2 %#x DBG3 %#x\n",
+			TO_MHI_EXEC_STR(ee), code, d1, d2, d3);
+		if (mhi_cntrl->sfr_buf && !mhi_cntrl->sfr_printed) {
+			mhi_cntrl->sfr_buf[mhi_cntrl->sfr_len - 1] = '\0';
+			dev_err(dev, "modem crash reason (SFR): \"%s\"\n", mhi_cntrl->sfr_buf);
+			mhi_cntrl->sfr_printed = true;
+		}
 		pm_state = mhi_tryset_pm_state(mhi_cntrl,
 					       MHI_PM_SYS_ERR_DETECT);
 	}
@@ -540,6 +561,58 @@ exit_intvec:
 
 	return IRQ_HANDLED;
 }
+
+/*
+ * Run the interrupt handlers as if every MHI vector had fired. For hosts
+ * where some device MSIs get lost (kebab's SDX55 in SBL), so state changes
+ * and events are still picked up, at polling latency. Harmless when idle.
+ */
+void mhi_poll_irqs(struct mhi_controller *mhi_cntrl)
+{
+	struct mhi_event *mhi_event = mhi_cntrl->mhi_event;
+	int i;
+
+	if (!mhi_cntrl->mhi_ctxt)
+		return;
+
+	wake_up_all(&mhi_cntrl->state_event);
+	mhi_intvec_threaded_handler(0, mhi_cntrl);
+
+	for (i = 0; i < mhi_cntrl->total_ev_rings; i++, mhi_event++) {
+		if (mhi_event->offload_ev)
+			continue;
+		mhi_irq_handler(0, mhi_event);
+	}
+
+	/*
+	 * kebab's SDX55 SBL never posts an EE event on the control ring (the
+	 * downstream host followed the EE register instead), so do the same:
+	 * once the device is in M0 in a newer EE than the host, queue the
+	 * transition the EE event would have queued.
+	 */
+	if (mhi_cntrl->pm_state == MHI_PM_M0) {
+		enum mhi_ee_type ee = mhi_get_exec_env(mhi_cntrl);
+		enum dev_st_transition st = DEV_ST_TRANSITION_MAX;
+
+		if (ee == MHI_EE_PBL)
+			mhi_cntrl->dbg_ee_queued = MHI_EE_PBL;
+		else if (ee != mhi_cntrl->ee && ee != mhi_cntrl->dbg_ee_queued) {
+			if (ee == MHI_EE_SBL)
+				st = DEV_ST_TRANSITION_SBL;
+			else if (ee == MHI_EE_AMSS)
+				st = DEV_ST_TRANSITION_MISSION_MODE;
+		}
+
+		if (st != DEV_ST_TRANSITION_MAX) {
+			dev_info(&mhi_cntrl->mhi_dev->dev,
+				 "device in %s, host in %s: queueing transition\n",
+				 TO_MHI_EXEC_STR(ee), TO_MHI_EXEC_STR(mhi_cntrl->ee));
+			mhi_cntrl->dbg_ee_queued = ee;
+			mhi_queue_state_transition(mhi_cntrl, st);
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(mhi_poll_irqs);
 
 irqreturn_t mhi_intvec_handler(int irq_number, void *dev)
 {
@@ -804,7 +877,10 @@ static void mhi_process_cmd_completion(struct mhi_controller *mhi_cntrl,
 
 	chan = MHI_TRE_GET_CMD_CHID(cmd_pkt);
 
-	if (chan < mhi_cntrl->max_chan &&
+	if (MHI_TRE_GET_CMD_TYPE(cmd_pkt) == MHI_CMD_SFR_CFG) {
+		dev_info(&mhi_cntrl->mhi_dev->dev, "SFR buffer configured (completion code %lu)\n",
+			 MHI_TRE_GET_EV_CODE(tre));
+	} else if (chan < mhi_cntrl->max_chan &&
 	    mhi_cntrl->mhi_chan[chan].configured) {
 		mhi_chan = &mhi_cntrl->mhi_chan[chan];
 		write_lock_bh(&mhi_chan->lock);
@@ -1281,6 +1357,22 @@ bool mhi_queue_is_full(struct mhi_device *mhi_dev, enum dma_data_direction dir)
 }
 EXPORT_SYMBOL_GPL(mhi_queue_is_full);
 
+int mhi_setup_sfr(struct mhi_controller *mhi_cntrl, size_t len)
+{
+	if (!mhi_cntrl->sfr_buf) {
+		mhi_cntrl->sfr_buf = dmam_alloc_coherent(mhi_cntrl->cntrl_dev, len,
+							 &mhi_cntrl->sfr_dma, GFP_KERNEL);
+		if (!mhi_cntrl->sfr_buf)
+			return -ENOMEM;
+		mhi_cntrl->sfr_len = len;
+	}
+	memset(mhi_cntrl->sfr_buf, 0, mhi_cntrl->sfr_len);
+	mhi_cntrl->sfr_printed = false;
+
+	return mhi_send_cmd(mhi_cntrl, NULL, MHI_CMD_SFR_CFG);
+}
+EXPORT_SYMBOL_GPL(mhi_setup_sfr);
+
 int mhi_send_cmd(struct mhi_controller *mhi_cntrl,
 		 struct mhi_chan *mhi_chan,
 		 enum mhi_cmd_type cmd)
@@ -1317,6 +1409,11 @@ int mhi_send_cmd(struct mhi_controller *mhi_cntrl,
 		cmd_tre->ptr = MHI_TRE_CMD_START_PTR;
 		cmd_tre->dword[0] = MHI_TRE_CMD_START_DWORD0;
 		cmd_tre->dword[1] = MHI_TRE_CMD_START_DWORD1(chan);
+		break;
+	case MHI_CMD_SFR_CFG:
+		cmd_tre->ptr = cpu_to_le64(mhi_cntrl->sfr_dma);
+		cmd_tre->dword[0] = cpu_to_le32(mhi_cntrl->sfr_len - 1);
+		cmd_tre->dword[1] = cpu_to_le32(FIELD_PREP(GENMASK(23, 16), MHI_CMD_SFR_CFG));
 		break;
 	default:
 		dev_err(dev, "Command not supported\n");

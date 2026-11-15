@@ -261,7 +261,7 @@ static int mhi_fw_load_bhi(struct mhi_controller *mhi_cntrl,
 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
 	rwlock_t *pm_lock = &mhi_cntrl->pm_lock;
 	void __iomem *base = mhi_cntrl->bhi;
-	u32 tx_status, session_id;
+	u32 tx_status = 0, session_id;
 	int ret;
 
 	read_lock_bh(pm_lock);
@@ -271,8 +271,8 @@ static int mhi_fw_load_bhi(struct mhi_controller *mhi_cntrl,
 	}
 
 	session_id = MHI_RANDOM_U32_NONZERO(BHI_TXDB_SEQNUM_BMSK);
-	dev_dbg(dev, "Starting image download via BHI. Session ID: %u\n",
-		session_id);
+	dev_info(dev, "BHI start: image %pad len %zu session %u pm_state %#x\n",
+		 &mhi_buf->dma_addr, mhi_buf->len, session_id, mhi_cntrl->pm_state);
 	mhi_write_reg(mhi_cntrl, base, BHI_STATUS, 0);
 	mhi_write_reg(mhi_cntrl, base, BHI_IMGADDR_HIGH, upper_32_bits(mhi_buf->dma_addr));
 	mhi_write_reg(mhi_cntrl, base, BHI_IMGADDR_LOW, lower_32_bits(mhi_buf->dma_addr));
@@ -286,6 +286,18 @@ static int mhi_fw_load_bhi(struct mhi_controller *mhi_cntrl,
 			   mhi_read_reg_field(mhi_cntrl, base, BHI_STATUS,
 					      BHI_STATUS_MASK, &tx_status) || tx_status,
 			   msecs_to_jiffies(mhi_cntrl->timeout_ms));
+	{
+		u32 raw = 0;
+
+		if (mhi_read_reg(mhi_cntrl, base, BHI_STATUS, &raw))
+			raw = ~0U;
+		dev_info(dev, "BHI end: wait %d pm_state %#x tx_status %u BHI_STATUS %#x mhi state %d ee %d\n",
+			 ret, mhi_cntrl->pm_state, tx_status, raw,
+			 mhi_get_mhi_state(mhi_cntrl), mhi_get_exec_env(mhi_cntrl));
+		if (!ret || raw >> 30 == BHI_STATUS_ERROR || MHI_PM_IN_ERROR_STATE(mhi_cntrl->pm_state))
+			mhi_fw_load_error_dump(mhi_cntrl);
+	}
+
 	if (MHI_PM_IN_ERROR_STATE(mhi_cntrl->pm_state))
 		goto invalid_pm_state;
 
@@ -466,6 +478,12 @@ static int mhi_load_image_bhi(struct mhi_controller *mhi_cntrl, const u8 *fw_dat
 	memcpy(image->mhi_buf->buf, fw_data, size);
 
 	ret = mhi_fw_load_bhi(mhi_cntrl, &image->mhi_buf[image->entries - 1]);
+	/*
+	 * If the host gave up early the device may still be fetching the
+	 * image; give it time so it doesn't DMA from a freed IOVA.
+	 */
+	if (ret)
+		msleep(2000);
 	mhi_free_bhi_buffer(mhi_cntrl, image);
 
 	return ret;
