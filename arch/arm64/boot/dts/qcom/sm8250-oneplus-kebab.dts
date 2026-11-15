@@ -162,12 +162,30 @@
 };
 
 &slpi {
-	firmware-name = "qcom/sm8250/OnePlus/kebab/slpi.mbn";
+	firmware-name = "slpi.mdt";
 
 	status = "okay";
 };
 
 &tlmm {
+	/*
+	 * External SDX55 handshake (downstream esoc mdm0): tell the modem the
+	 * AP is up and has not crashed, as the esoc driver does at power-on.
+	 */
+	ap2mdm-status-hog {
+		gpio-hog;
+		gpios = <56 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "ap2mdm-status";
+	};
+
+	ap2mdm-errfatal-hog {
+		gpio-hog;
+		gpios = <57 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "ap2mdm-errfatal";
+	};
+
 	pm8008_default: pm8008-default-state {
 		pins = "gpio93";
 		function = "gpio";
@@ -256,4 +274,14 @@
 
 &wlan0 {
 	qcom,calibration-variant = "OnePlus_8T";
+};
+
+/* X55 handshake lines, as on Sony edo (same SM8250 + SDX55 wiring) */
+&pcie2 {
+	pinctrl-0 = <&pcie2_default_state &ap2mdm_active>;
+	/*
+	 * Bring-up: the X55's MSIs to cfg0_base (0x64100000) were not
+	 * terminated by iMSI-RX and hit the SMMU; try a RAM target instead.
+	 */
+	snps,msi-target-in-ram;
 };
