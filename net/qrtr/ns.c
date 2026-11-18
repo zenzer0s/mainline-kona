@@ -435,20 +435,29 @@ static int ctrl_cmd_del_client(struct sockaddr_qrtr *from,
 	struct list_head *li;
 	unsigned long index;
 	struct kvec iv;
+	unsigned int removed;
 	int ret;
 
 	iv.iov_base = &pkt;
 	iv.iov_len = sizeof(pkt);
 
-	/* Don't accept spoofed messages */
-	if (from->sq_node != node_id)
-		return -EINVAL;
-
 	/* Local DEL_CLIENT messages comes from the port being closed */
-	if (from->sq_node == qrtr_ns.local_node && from->sq_port != port)
-		return -EINVAL;
+	if (from->sq_node == qrtr_ns.local_node) {
+		if (from->sq_port != port)
+			return -EINVAL;
+	} else if (from->sq_node != node_id) {
+		/*
+		 * The external SDX55 has multiple PDs (root on node 2 cleaning
+		 * up a user PD on node 3); the vendor nameserver propagates
+		 * these cross-node DEL_CLIENT messages. Rejecting them leaves
+		 * stale services after a modem PD restart.
+		 */
+		pr_debug("qrtr: cross-node DEL_CLIENT from %d for [%d:%d]\n",
+			 from->sq_node, node_id, port);
+	}
 
 	/* Remove any lookups by this client */
+	removed = 0;
 	list_for_each_safe(li, tmp, &qrtr_ns.lookups) {
 		lookup = container_of(li, struct qrtr_lookup, li);
 		if (lookup->sq.sq_node != node_id)
@@ -459,7 +468,11 @@ static int ctrl_cmd_del_client(struct sockaddr_qrtr *from,
 		list_del(&lookup->li);
 		kfree(lookup);
 		qrtr_ns.lookup_count--;
+		removed++;
 	}
+	if (removed)
+		pr_debug("lookup del: node %u port %u removed %u (count %u)\n",
+			 node_id, port, removed, qrtr_ns.lookup_count);
 
 	/* Remove the server belonging to this port but don't broadcast
 	 * DEL_SERVER. Neighbours would've already removed the server belonging
@@ -577,7 +590,9 @@ static int ctrl_cmd_new_lookup(struct sockaddr_qrtr *from,
 		return -EINVAL;
 
 	if (qrtr_ns.lookup_count >= QRTR_NS_MAX_LOOKUPS) {
-		pr_err_ratelimited("QRTR client node exceeds max lookup limit!\n");
+		pr_err_ratelimited("QRTR client node exceeds max lookup limit (%u lookups, service %u instance %u from node %u port %u)!\n",
+				   qrtr_ns.lookup_count, service, instance,
+				   from->sq_node, from->sq_port);
 		return -ENOSPC;
 	}
 
@@ -590,6 +605,9 @@ static int ctrl_cmd_new_lookup(struct sockaddr_qrtr *from,
 	lookup->instance = instance;
 	list_add_tail(&lookup->li, &qrtr_ns.lookups);
 	qrtr_ns.lookup_count++;
+	pr_debug("lookup add: service %u instance %u from node %u port %u (count %u)\n",
+		 service, instance, from->sq_node, from->sq_port,
+		 qrtr_ns.lookup_count);
 
 	memset(&filter, 0, sizeof(filter));
 	filter.service = service;
@@ -616,6 +634,7 @@ static void ctrl_cmd_del_lookup(struct sockaddr_qrtr *from,
 	struct qrtr_lookup *lookup;
 	struct list_head *tmp;
 	struct list_head *li;
+	unsigned int removed = 0;
 
 	list_for_each_safe(li, tmp, &qrtr_ns.lookups) {
 		lookup = container_of(li, struct qrtr_lookup, li);
@@ -631,7 +650,12 @@ static void ctrl_cmd_del_lookup(struct sockaddr_qrtr *from,
 		list_del(&lookup->li);
 		kfree(lookup);
 		qrtr_ns.lookup_count--;
+		removed++;
 	}
+	if (removed)
+		pr_debug("lookup del: service %u instance %u from node %u port %u removed %u (count %u)\n",
+			 service, instance, from->sq_node, from->sq_port, removed,
+			 qrtr_ns.lookup_count);
 }
 
 static void qrtr_ns_worker(struct work_struct *work)

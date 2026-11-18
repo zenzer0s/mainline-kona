@@ -55,6 +55,9 @@ static int mhi_ndo_open(struct net_device *ndev)
 
 	netif_start_queue(ndev);
 
+	netdev_info(ndev, "open: mru %u mtu %u rx_queue %u\n",
+		    mhi_netdev->mru, ndev->mtu, mhi_netdev->rx_queue_sz);
+
 	return 0;
 }
 
@@ -65,6 +68,9 @@ static int mhi_ndo_stop(struct net_device *ndev)
 	netif_stop_queue(ndev);
 	netif_carrier_off(ndev);
 	cancel_delayed_work_sync(&mhi_netdev->rx_refill);
+
+	netdev_info(ndev, "stop: free rx desc %d\n",
+		    mhi_get_free_desc_count(mhi_netdev->mdev, DMA_FROM_DEVICE));
 
 	return 0;
 }
@@ -194,6 +200,10 @@ static void mhi_net_dl_callback(struct mhi_device *mhi_dev,
 			return;
 		default:
 			/* Unknown error, simply drop */
+			net_err_ratelimited("%s: RX error %d (%zu bytes dropped)\n",
+					    mhi_netdev->ndev->name,
+					    mhi_res->transaction_status,
+					    mhi_res->bytes_xferd);
 			dev_kfree_skb_any(skb);
 			u64_stats_update_begin(&mhi_netdev->stats.rx_syncp);
 			u64_stats_inc(&mhi_netdev->stats.rx_errors);
@@ -239,6 +249,7 @@ static void mhi_net_ul_callback(struct mhi_device *mhi_dev,
 	struct net_device *ndev = mhi_netdev->ndev;
 	struct mhi_device *mdev = mhi_netdev->mdev;
 	struct sk_buff *skb = mhi_res->buf_addr;
+	int tx_err = 0;
 
 	/* Hardware has consumed the buffer, so free the skb (which is not
 	 * freed by the MHI stack) and perform accounting.
@@ -254,11 +265,15 @@ static void mhi_net_ul_callback(struct mhi_device *mhi_dev,
 		}
 
 		u64_stats_inc(&mhi_netdev->stats.tx_errors);
+		tx_err = mhi_res->transaction_status;
 	} else {
 		u64_stats_inc(&mhi_netdev->stats.tx_packets);
 		u64_stats_add(&mhi_netdev->stats.tx_bytes, mhi_res->bytes_xferd);
 	}
 	u64_stats_update_end(&mhi_netdev->stats.tx_syncp);
+
+	if (tx_err)
+		net_err_ratelimited("%s: TX error %d\n", ndev->name, tx_err);
 
 	if (netif_queue_stopped(ndev) && !mhi_queue_is_full(mdev, DMA_TO_DEVICE))
 		netif_wake_queue(ndev);
@@ -278,8 +293,11 @@ static void mhi_net_rx_refill_work(struct work_struct *work)
 
 	while (!mhi_queue_is_full(mdev, DMA_FROM_DEVICE)) {
 		skb = netdev_alloc_skb(ndev, size);
-		if (unlikely(!skb))
+		if (unlikely(!skb)) {
+			net_err_ratelimited("%s: RX skb alloc failed (%u bytes)\n",
+					    ndev->name, size);
 			break;
+		}
 
 		err = mhi_queue_skb(mdev, DMA_FROM_DEVICE, skb, size, MHI_EOT);
 		if (unlikely(err)) {
@@ -319,15 +337,25 @@ static int mhi_net_newlink(struct mhi_device *mhi_dev, struct net_device *ndev)
 
 	/* Start MHI channels */
 	err = mhi_prepare_for_transfer(mhi_dev);
-	if (err)
+	if (err) {
+		dev_err(&mhi_dev->dev, "prepare_for_transfer failed: %d\n", err);
 		return err;
+	}
 
 	/* Number of transfer descriptors determines size of the queue */
 	mhi_netdev->rx_queue_sz = mhi_get_free_desc_count(mhi_dev, DMA_FROM_DEVICE);
 
 	err = register_netdev(ndev);
-	if (err)
+	if (err) {
+		dev_err(&mhi_dev->dev, "register_netdev failed: %d\n", err);
+		mhi_unprepare_from_transfer(mhi_dev);
+		dev_set_drvdata(&mhi_dev->dev, NULL);
+		free_netdev(ndev);
 		return err;
+	}
+
+	dev_info(&mhi_dev->dev, "%s ready: mru %u, rx queue %u desc, mtu %u\n",
+		 ndev->name, mhi_netdev->mru, mhi_netdev->rx_queue_sz, ndev->mtu);
 
 	return 0;
 }
@@ -335,6 +363,18 @@ static int mhi_net_newlink(struct mhi_device *mhi_dev, struct net_device *ndev)
 static void mhi_net_dellink(struct mhi_device *mhi_dev, struct net_device *ndev)
 {
 	struct mhi_net_dev *mhi_netdev = netdev_priv(ndev);
+
+	/* Channel may be gone already: report what the stats saw. */
+	dev_info(&mhi_dev->dev,
+		 "%s removed: rx %llu pkts %llu bytes, tx %llu pkts %llu bytes, err rx/tx %llu/%llu, drop %llu\n",
+		 ndev->name,
+		 u64_stats_read(&mhi_netdev->stats.rx_packets),
+		 u64_stats_read(&mhi_netdev->stats.rx_bytes),
+		 u64_stats_read(&mhi_netdev->stats.tx_packets),
+		 u64_stats_read(&mhi_netdev->stats.tx_bytes),
+		 u64_stats_read(&mhi_netdev->stats.rx_errors),
+		 u64_stats_read(&mhi_netdev->stats.tx_errors),
+		 u64_stats_read(&mhi_netdev->stats.tx_dropped));
 
 	unregister_netdev(ndev);
 

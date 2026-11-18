@@ -261,9 +261,18 @@ static int qrtr_tx_wait(struct qrtr_node *node, int dest_node, int dest_port,
 	int confirm_rx = 0;
 	int ret;
 
-	/* Never set confirm_rx on non-data packets */
-	if (type != QRTR_TYPE_DATA)
+	/*
+	 * Remote DSP/modem endpoints never send RESUME_TX. Tracking the
+	 * confirm_rx flow for them would block forever once QRTR_TX_FLOW_HIGH
+	 * is reached, so skip the accounting and rely on the transport queue.
+	 * Keep the teardown check: transmissions to a removed endpoint must
+	 * fail instead of succeeding silently.
+	 */
+	if (type != QRTR_TYPE_DATA || dest_node != qrtr_local_nid) {
+		if (type == QRTR_TYPE_DATA && !node->ep)
+			return -EPIPE;
 		return 0;
+	}
 
 	mutex_lock(&node->qrtr_tx_lock);
 	flow = xa_load(&node->qrtr_tx_flow, key);

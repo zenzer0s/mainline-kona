@@ -11,6 +11,7 @@
 #include <dt-bindings/media/video-interfaces.h>
 #include <dt-bindings/phy/phy.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include <dt-bindings/soc/qcom,apr.h>
 #include <dt-bindings/sound/qcom,q6asm.h>
 #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 #include <dt-bindings/usb/pd.h>
@@ -65,14 +66,18 @@
 			compatible = "simple-framebuffer";
 			memory-region = <&framebuffer_mem>;
 			format = "a8r8g8b8";
+			/*
+			 * No BYTE0/BYTE0_INTF/PCLK0 here: their parent is the DSI PHY
+			 * PLL, which only registers later. Enabling them while still
+			 * orphaned made the reparent at PHY probe disable a parent that
+			 * was never enabled (clk.c WARN x2, taint). The bootloader's
+			 * PLL keeps running (clk_ignore_unused) until msm takes over.
+			 */
 			clocks = <&dispcc DISP_CC_MDSS_AHB_CLK>,
 				 <&gcc GCC_DISP_HF_AXI_CLK>,
 				 <&gcc GCC_DISP_SF_AXI_CLK>,
 				 <&dispcc DISP_CC_MDSS_VSYNC_CLK>,
 				 <&dispcc DISP_CC_MDSS_MDP_CLK>,
-				 <&dispcc DISP_CC_MDSS_BYTE0_CLK>,
-				 <&dispcc DISP_CC_MDSS_BYTE0_INTF_CLK>,
-				 <&dispcc DISP_CC_MDSS_PCLK0_CLK>,
 				 <&dispcc DISP_CC_MDSS_ESC0_CLK>;
 			power-domains = <&dispcc MDSS_GDSC>;
 		};
@@ -239,16 +244,36 @@
 			no-map;
 		};
 
+		kboot_uboot_logmem: memory@9fe00000 {
+			reg = <0x0 0x9fe00000 0x0 0x200000>;
+			compatible = "oplus,xbl_uefi_kbootlog";
+			xbluefi-offset = <0x1f7000>;
+			no-map;
+		};
+
+		/*
+		 * 0xb0000000..0xb0400000 is the "ramoops" window XBL reserves in its
+		 * own memory map, next to the "Kernel" reservation that runs from
+		 * 0xa0000000 to 0xb0000000.
+		 */
 		ramoops: ramoops@b0000000 {
 			compatible = "ramoops";
 			reg = <0x0 0xb0000000 0x0 0x400000>;
-			record-size = <0x40000>;
-			console-size = <0x40000>;
-			ftrace-size =  <0x40000>;
-			pmsg-size = <0x200000>;
+			record-size = <0x80000>;
+			console-size = <0x140000>;
+			pmsg-size = <0x80000>;
+			ftrace-size = <0x20000>;
 			ecc-size = <0x0>;
+			max-reason = <4>;
 		};
-	};
+	
+		mailbox_mem: mailbox@9f000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x9f000000 0x0 0x20000>;
+			no-map;
+			alignment = <0x0 0x400000>;
+		};
+};
 
 	vph_pwr: vph-pwr-regulator {
 		compatible = "regulator-fixed";
@@ -641,6 +666,8 @@
 };
 
 &i2c1 {
+	clock-frequency = <400000>;
+
 	status = "okay";
 
 	nfc@28 {
@@ -653,6 +680,8 @@
 };
 
 &i2c11 {
+	clock-frequency = <400000>;
+
 	status = "okay";
 
 	haptics@5a {
@@ -679,6 +708,8 @@
 };
 
 &i2c15 {
+	clock-frequency = <400000>;
+
 	status = "okay";
 
 	fsa4480: typec-mux@42 {
@@ -1066,6 +1097,13 @@
 	pinctrl-1 = <&tert_mi2s_suspend>;
 	pinctrl-names = "default", "sleep";
 
+	cs-voice-dai-link {
+		link-name = "CS-VOICE";
+		cpu {
+			sound-dai = <&q6voicedai>;
+		};
+	};
+
 	mm1-dai-link {
 		link-name = "MultiMedia1";
 
@@ -1130,22 +1168,11 @@
 		};
 	};
 
-	displayport-dai-link {
-		link-name = "DisplayPort Playback";
-
-		codec {
-			sound-dai = <&mdss_dp>;
-		};
-
-		cpu {
-			sound-dai = <&q6afedai DISPLAY_PORT_RX>;
-		};
-
-		platform {
-			sound-dai = <&q6routing>;
-		};
-	};
-
+	/*
+	 * No DisplayPort audio link: AFE port 0x6020 (DISPLAY_PORT_RX) fails to
+	 * start with DSP error 9 / -110 whenever it gets prepared, and USB-C DP
+	 * audio is not used on these phones.
+	 */
 	speaker-dai-link {
 		link-name = "Speaker Playback";
 
@@ -1475,4 +1502,55 @@
 	pinctrl-names = "default", "sleep";
 	vdd-micb-supply = <&vreg_bob>;
 	qcom,dmic-sample-rate = <2400000>;
+};
+
+/*
+ * ADSP voice services (MVM/CVS/CVP, APR 9/10/11). The external X55 needs the
+ * ADSP voice path before it accepts a call. CS-VOICE is a hostless front end:
+ * userspace opens it for the duration of a call to create/tear down the
+ * session; samples never pass through the CPU.
+ */
+&apr {
+	q6mvm: service@9 {
+		compatible = "qcom,q6mvm";
+		reg = <APR_SVC_ADSP_MVM>;
+		qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+
+		q6voicedai: dais {
+			compatible = "qcom,q6voice-dais";
+			#sound-dai-cells = <0>;
+		};
+	};
+
+	q6cvs: service@a {
+		compatible = "qcom,q6cvs";
+		reg = <APR_SVC_ADSP_CVS>;
+		qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+	};
+
+	q6cvp: service@b {
+		compatible = "qcom,q6cvp";
+		reg = <APR_SVC_ADSP_CVP>;
+		qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+	};
+};
+
+/*
+ * Voice mailbox for the PCIe-attached SDX55: the modem reaches it through
+ * the PCIe SMMU and the ADSP through its own, so q6voice-mhi maps the same
+ * reserved memory into both and tells the ADSP about it. Same stream id as
+ * the audio DAIs (0x1801), otherwise one of the mappings is silently dropped
+ * to direct DMA and the DSP gets a physical address where it needs an IOVA.
+ */
+&q6mvm {
+	q6voicemhi: mailbox {
+		compatible = "qcom,q6voice-mhi";
+		iommus = <&apps_smmu 0x1801 0x0>;
+		memory-region = <&mailbox_mem>;
+	};
+
+	q6voicecal: calibration {
+		compatible = "qcom,q6voice-cal";
+		iommus = <&apps_smmu 0x1801 0x0>;
+	};
 };

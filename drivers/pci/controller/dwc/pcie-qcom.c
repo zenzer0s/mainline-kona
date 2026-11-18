@@ -44,6 +44,7 @@
 /* PARF registers */
 #define PARF_SYS_CTRL				0x00
 #define PARF_PM_CTRL				0x20
+#define PARF_PM_STTS				0x24
 #define PARF_PCS_DEEMPH				0x34
 #define PARF_PCS_SWING				0x38
 #define PARF_PHY_CTRL				0x40
@@ -97,6 +98,12 @@
 
 /* PARF_PM_CTRL register fields */
 #define REQ_NOT_ENTR_L1				BIT(5)
+
+/* PARF_PM_STTS register fields */
+#define PM_STTS_LINKST_IN_L23			BIT(5)
+
+/* ELBI_SYS_CTRL register fields */
+#define ELBI_SYS_CTRL_PME_TURN_OFF		BIT(4)
 
 /* PARF_PCS_DEEMPH register fields */
 #define PCS_DEEMPH_TX_DEEMPH_GEN1(x)		FIELD_PREP(GENMASK(21, 16), x)
@@ -1309,6 +1316,154 @@ static bool qcom_pcie_link_up(struct dw_pcie *pci)
 	return val & PCI_EXP_LNKSTA_DLLLA;
 }
 
+static void qcom_pcie_phy_power_off(struct qcom_pcie *pcie);
+static int qcom_pcie_phy_power_on(struct qcom_pcie *pcie);
+
+/*
+ * Full RC-side reset without toggling PERST#: the endpoint (external modem)
+ * may have dropped the link during its SBL->AMSS transition, and a cold reset
+ * would take it back to PBL. Re-program the DWC ATU/MSI afterwards because
+ * everything in DBI was lost with the core reset.
+ */
+int qcom_pcie_retrain_link(struct pci_dev *pdev)
+{
+	struct pci_host_bridge *host = pci_find_host_bridge(pdev->bus);
+	struct qcom_pcie *pcie = dev_get_drvdata(host->dev.parent);
+	struct dw_pcie *pci = pcie->pci;
+	u32 val;
+	int retries, ret;
+
+	dev_info(pci->dev, "retraining PCIe link for %s\n", dev_name(&pdev->dev));
+
+	val = readl(pcie->parf + PARF_LTSSM);
+	val &= ~LTSSM_EN;
+	writel(val, pcie->parf + PARF_LTSSM);
+
+	qcom_pcie_phy_power_off(pcie);
+	pcie->cfg->ops->deinit(pcie);
+
+	msleep(5);
+
+	ret = pcie->cfg->ops->init(pcie);
+	if (ret) {
+		dev_err(pci->dev, "init failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = qcom_pcie_phy_power_on(pcie);
+	if (ret) {
+		dev_err(pci->dev, "PHY power-on failed: %d\n", ret);
+		return ret;
+	}
+
+	if (pcie->cfg->ops->post_init) {
+		ret = pcie->cfg->ops->post_init(pcie);
+		if (ret) {
+			dev_err(pci->dev, "post_init failed: %d\n", ret);
+			return ret;
+		}
+	}
+
+	ret = dw_pcie_setup_rc(&pci->pp);
+	if (ret) {
+		dev_err(pci->dev, "RC setup failed: %d\n", ret);
+		return ret;
+	}
+
+	if (pcie->cfg->ops->ltssm_enable)
+		pcie->cfg->ops->ltssm_enable(pcie);
+
+	for (retries = 0; retries < 100; retries++) {
+		if (dw_pcie_link_up(pci))
+			break;
+		msleep(100);
+	}
+
+	if (!dw_pcie_link_up(pci)) {
+		dev_err(pci->dev, "link retrain failed: link not up after 10s\n");
+		return -ETIMEDOUT;
+	}
+
+	dev_info(pci->dev, "link retrained in %d ms\n", retries * 100);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_pcie_retrain_link);
+
+/* Send PME_Turn_Off and wait for the link to report L23_Ready. */
+int qcom_pcie_l23_ready(struct pci_dev *pdev)
+{
+	struct pci_host_bridge *host = pci_find_host_bridge(pdev->bus);
+	struct qcom_pcie *pcie = dev_get_drvdata(host->dev.parent);
+	struct dw_pcie *pci = pcie->pci;
+	u32 val;
+	int ret;
+
+	if (!pci->elbi_base) {
+		dev_err(pci->dev, "ELBI is not present\n");
+		return -ENODEV;
+	}
+
+	writel(ELBI_SYS_CTRL_PME_TURN_OFF, pci->elbi_base + ELBI_SYS_CTRL);
+	readl(pci->elbi_base + ELBI_SYS_CTRL);
+
+	ret = readl_poll_timeout(pcie->parf + PARF_PM_STTS, val,
+				 val & PM_STTS_LINKST_IN_L23, 1000, 100000);
+	if (ret) {
+		dev_warn(pci->dev,
+			 "L23_Ready not reached (PARF_PM_STTS=0x%08x)\n",
+			 readl(pcie->parf + PARF_PM_STTS));
+		return -ETIMEDOUT;
+	}
+
+	dev_info(pci->dev, "link entered L23_Ready\n");
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_pcie_l23_ready);
+
+/*
+ * Cold-reset the endpoint back to PBL via PERST#. Used only when a rebuild
+ * cannot recover the link; the modem has to boot its firmware again.
+ */
+int qcom_pcie_perst_toggle(struct pci_dev *pdev)
+{
+	struct pci_host_bridge *host = pci_find_host_bridge(pdev->bus);
+	struct qcom_pcie *pcie = dev_get_drvdata(host->dev.parent);
+	struct dw_pcie *pci = pcie->pci;
+	u32 val;
+	int retries;
+
+	dev_info(pci->dev, "asserting PERST# to cold-reset %s\n",
+		 dev_name(&pdev->dev));
+
+	val = readl(pcie->parf + PARF_LTSSM);
+	val &= ~LTSSM_EN;
+	writel(val, pcie->parf + PARF_LTSSM);
+
+	qcom_pcie_perst_assert(pcie);
+	msleep(PCIE_T_PVPERL_MS + 50);
+	qcom_pcie_perst_deassert(pcie);
+
+	val = readl(pcie->parf + PARF_LTSSM);
+	val |= LTSSM_EN;
+	writel(val, pcie->parf + PARF_LTSSM);
+
+	for (retries = 0; retries < 100; retries++) {
+		if (dw_pcie_link_up(pci))
+			break;
+		msleep(100);
+	}
+
+	if (!dw_pcie_link_up(pci)) {
+		dev_err(pci->dev, "PERST# toggle: link not up after 10 s\n");
+		return -ETIMEDOUT;
+	}
+
+	dev_info(pci->dev, "PERST# toggle: link up in %d ms\n",
+		 100 + retries * 100);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_pcie_perst_toggle);
+
 static enum dw_pcie_ltssm qcom_pcie_get_ltssm(struct dw_pcie *pci)
 {
 	struct qcom_pcie *pcie = to_qcom_pcie(pci);
@@ -1442,6 +1597,67 @@ static void qcom_pcie_host_deinit(struct dw_pcie_rp *pp)
 	qcom_pcie_phy_power_off(pcie);
 	pcie->cfg->ops->deinit(pcie);
 }
+
+/*
+ * Rebuild a link that has gone down, e.g. because an external modem reset
+ * itself. This is the same deinit/init pair the controller's own resume path
+ * uses, followed by the DWC setup the normal host init performs (bus numbers,
+ * iATU, MSI). Only safe while the link is already down.
+ */
+int qcom_pcie_relink(struct pci_dev *pdev)
+{
+	struct pci_host_bridge *host = pci_find_host_bridge(pdev->bus);
+	struct qcom_pcie *pcie = dev_get_drvdata(host->dev.parent);
+	struct dw_pcie *pci = pcie->pci;
+	bool suspended;
+	int ret;
+
+	if (dw_pcie_link_up(pci)) {
+		dev_info(pci->dev, "link already up, not relinking\n");
+		return 0;
+	}
+
+	dev_info(pci->dev, "relinking %s: controller deinit/init\n",
+		 dev_name(&pdev->dev));
+
+	qcom_pcie_host_deinit(&pci->pp);
+
+	/*
+	 * The pwrctrl devices survive host_deinit(); mark the controller as
+	 * suspended so host_init powers them back on instead of creating them
+	 * a second time.
+	 */
+	suspended = pci->suspended;
+	pci->suspended = true;
+	ret = qcom_pcie_host_init(&pci->pp);
+	pci->suspended = suspended;
+	if (ret) {
+		dev_err(pci->dev, "relink: host init failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = dw_pcie_setup_rc(&pci->pp);
+	if (ret) {
+		dev_err(pci->dev, "relink: RC setup failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = dw_pcie_start_link(pci);
+	if (ret) {
+		dev_err(pci->dev, "relink: could not start link: %d\n", ret);
+		return ret;
+	}
+
+	ret = dw_pcie_wait_for_link(pci);
+	if (ret) {
+		dev_err(pci->dev, "relink: link did not come up: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(pci->dev, "relink: link up\n");
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_pcie_relink);
 
 static void qcom_pcie_host_post_init(struct dw_pcie_rp *pp)
 {

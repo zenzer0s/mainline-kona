@@ -6078,7 +6078,7 @@
 				label = "lpass";
 				qcom,remote-pid = <2>;
 
-				apr {
+				apr: apr {
 					compatible = "qcom,apr-v2";
 					qcom,glink-channels = "apr_audio_svc";
 					qcom,domain = <APR_DOMAIN_ADSP>;
@@ -6089,6 +6089,7 @@
 						reg = <APR_SVC_ADSP_CORE>;
 						compatible = "qcom,q6core";
 						qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+						iommus = <&apps_smmu 0x1801 0x0>;
 					};
 
 					q6afe: service@4 {

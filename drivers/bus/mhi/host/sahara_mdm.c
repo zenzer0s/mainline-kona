@@ -12,6 +12,7 @@
 
 #include <linux/devcoredump.h>
 #include <linux/firmware.h>
+#include <linux/kernel.h>
 #include <linux/limits.h>
 #include <linux/mhi.h>
 #include <linux/minmax.h>
@@ -25,6 +26,16 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+
+/*
+ * Off by default: writing the X55's EFS sync stream back to mdm1m9kefs*
+ * changes persistent modem state. Enable with sahara_mdm.efs_writeback=1
+ * once the received image set has been verified against the partitions.
+ */
+static bool efs_writeback;
+module_param(efs_writeback, bool, 0644);
+MODULE_PARM_DESC(efs_writeback,
+		 "Write EFS sync images back to mdm1m9kefs* partitions (default: off)");
 
 #define SAHARA_HELLO_CMD		0x1  /* Min protocol version 1.0 */
 #define SAHARA_HELLO_RESP_CMD		0x2  /* Min protocol version 1.0 */
@@ -231,6 +242,10 @@ struct sahara_context {
 	bool				is_efs;
 	/* current memory debug session uses the 32-bit MEM_DEBUG/MEM_READ */
 	bool				dump32;
+	/* number of entries parsed from the current dump table */
+	u32				dump_table_entries;
+	/* write EFS sync images back to the mdm1m9kefs* partitions */
+	bool				efs_writeback;
 };
 
 /*
@@ -767,6 +782,7 @@ static void sahara_parse_dump_table(struct sahara_context *context)
 
 	table_nents = context->dump_table_length / sizeof(*dev_table);
 	context->dump_images_left = table_nents;
+	context->dump_table_entries = table_nents;
 	dump_length = 0;
 
 	dev_table = (struct sahara_debug_table_entry64 *)(context->rx);
@@ -855,6 +871,127 @@ static void sahara_parse_dump_table(struct sahara_context *context)
 		dev_err(&context->mhi_dev->dev, "Unable to send read for dump content %d\n", ret);
 }
 
+#define SAHARA_EFS_MAX_IMAGE	(64u * 1024 * 1024)
+
+/*
+ * Map the names the X55 reports in its EFS memory-debug table to the
+ * partition labels on the host. The modem sends the short form
+ * ("m9kefs2"); the GPT labels carry the "mdm1" prefix.
+ */
+static const char *sahara_efs_partition_name(const char *name)
+{
+	static const struct {
+		const char *reported;
+		const char *partition;
+	} map[] = {
+		{ "m9kefs1", "mdm1m9kefs1" },
+		{ "mdm1m9kefs1", "mdm1m9kefs1" },
+		{ "m9kefs2", "mdm1m9kefs2" },
+		{ "mdm1m9kefs2", "mdm1m9kefs2" },
+		{ "m9kefs3", "mdm1m9kefs3" },
+		{ "mdm1m9kefs3", "mdm1m9kefs3" },
+		{ "oemnvbk", "mdm1oemnvbktmp" },
+		{ "oemnvbktmp", "mdm1oemnvbktmp" },
+		{ "mdm1oemnvbktmp", "mdm1oemnvbktmp" },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(map); i++)
+		if (!strcmp(name, map[i].reported))
+			return map[i].partition;
+	return NULL;
+}
+
+static int sahara_efs_write_file(struct sahara_context *context, const char *name,
+				 const void *data, u64 length)
+{
+	char path[PATH_MAX];
+	struct file *filp;
+	struct block_device *bdev;
+	loff_t pos = 0, part_size;
+	ssize_t n;
+	int ret;
+
+	/* Never touch a partition unless the whole image arrived and fits. */
+	if (!length || length > SAHARA_EFS_MAX_IMAGE)
+		return -EINVAL;
+
+	snprintf(path, sizeof(path), "/dev/block/bootdevice/by-name/%s", name);
+	filp = filp_open(path, O_RDWR | O_LARGEFILE, 0);
+	if (IS_ERR(filp)) {
+		dev_err(&context->mhi_dev->dev, "EFS %s: open failed %ld\n",
+			name, PTR_ERR(filp));
+		return PTR_ERR(filp);
+	}
+
+	bdev = file_bdev(filp);
+	if (!bdev) {
+		dev_err(&context->mhi_dev->dev, "EFS %s: not a block device\n",
+			name);
+		ret = -ENODEV;
+		goto out;
+	}
+	part_size = bdev_nr_bytes(bdev);
+	if (length != part_size) {
+		dev_err(&context->mhi_dev->dev,
+			"EFS %s: image %llu bytes != partition %lld bytes, not written\n",
+			name, length, part_size);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	n = kernel_write(filp, data, length, &pos);
+	if (n != (ssize_t)length) {
+		dev_err(&context->mhi_dev->dev, "EFS %s: short write %zd/%llu\n",
+			name, n, length);
+		ret = n < 0 ? n : -EIO;
+		goto out;
+	}
+
+	ret = vfs_fsync(filp, 0);
+	if (!ret)
+		dev_info(&context->mhi_dev->dev, "EFS %s: wrote %llu bytes\n",
+			 name, length);
+out:
+	filp_close(filp, NULL);
+	return ret;
+}
+
+static void sahara_efs_persist(struct sahara_context *context)
+{
+	struct sahara_dump_table_entry *entries;
+	const u8 *data;
+	u32 i;
+
+	if (!context->efs_writeback) {
+		dev_info(&context->mhi_dev->dev,
+			 "EFS sync received (%zu bytes), write-back disabled\n",
+			 context->mem_dump_sz);
+		return;
+	}
+
+	entries = (struct sahara_dump_table_entry *)
+		((u8 *)context->mem_dump + sizeof(struct sahara_memory_dump_meta_v1));
+	data = (const u8 *)&entries[context->dump_table_entries];
+
+	for (i = 0; i < context->dump_table_entries; i++) {
+		const char *part;
+
+		entries[i].filename[SAHARA_TABLE_ENTRY_STR_LEN - 1] = 0;
+		part = sahara_efs_partition_name(entries[i].filename);
+		if (part) {
+			dev_info(&context->mhi_dev->dev,
+				 "EFS entry \"%s\" (%llu bytes) -> partition %s\n",
+				 entries[i].filename, entries[i].length, part);
+			sahara_efs_write_file(context, part, data, entries[i].length);
+		} else
+			dev_warn(&context->mhi_dev->dev,
+				 "EFS entry \"%s\" (%llu bytes) not in partition whitelist\n",
+				 entries[i].filename, entries[i].length);
+		data += entries[i].length;
+	}
+}
+
 static void sahara_parse_dump_image(struct sahara_context *context)
 {
 	u64 dump_length;
@@ -872,9 +1009,7 @@ static void sahara_parse_dump_image(struct sahara_context *context)
 		if (!context->dump_images_left) {
 			/* Dump done */
 			if (context->is_efs) {
-				dev_info(&context->mhi_dev->dev,
-					 "EFS sync received (%zu bytes), discarded (not written)\n",
-					 context->mem_dump_sz);
+				sahara_efs_persist(context);
 				vfree(context->mem_dump);
 			} else {
 				dev_coredumpv(context->mhi_dev->mhi_cntrl->cntrl_dev,
@@ -1034,6 +1169,7 @@ static int sahara_mhi_probe(struct mhi_device *mhi_dev, const struct mhi_device_
 
 	context->mhi_dev = mhi_dev;
 	context->is_efs = !strcmp(id->chan, "EFS");
+	context->efs_writeback = efs_writeback;
 	INIT_WORK(&context->fw_work, sahara_processing);
 	INIT_WORK(&context->dump_work, sahara_dump_processing);
 	INIT_WORK(&context->read_data_work, sahara_read_data_processing);

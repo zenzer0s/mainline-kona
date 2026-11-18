@@ -169,10 +169,14 @@ static int __maybe_unused qcom_mhi_qrtr_pm_suspend_late(struct device *dev)
 
 	state = mhi_get_mhi_state(mhi_dev->mhi_cntrl);
 	/*
-	 * If the device is in suspend state, then no need for the
-	 * client driver to unprepare the channels.
+	 * Channels only have to be torn down if the device is going away.
+	 * M3 means it suspended with its context intact; M0 means the
+	 * controller declined to suspend it (the OnePlus SDX55 is kept
+	 * running with no_m3). Either way the channel stays valid, and
+	 * tearing it down forces a needless RESET/START round trip that can
+	 * time out and take the QRTR link with it.
 	 */
-	if (state == MHI_STATE_M3)
+	if (state == MHI_STATE_M3 || state == MHI_STATE_M0)
 		return 0;
 
 	mhi_unprepare_from_transfer(mhi_dev);
@@ -187,12 +191,9 @@ static int __maybe_unused qcom_mhi_qrtr_pm_resume_early(struct device *dev)
 	int rc;
 
 	state = mhi_get_mhi_state(mhi_dev->mhi_cntrl);
-	/*
-	 * If the device is in suspend state, we won't unprepare channels
-	 * in suspend callback, therefore no need to prepare channels when
-	 * resume.
-	 */
-	if (state == MHI_STATE_M3)
+	/* Mirror the suspend side: if the channel was never unprepared
+	 * there is nothing to restore. */
+	if (state == MHI_STATE_M3 || state == MHI_STATE_M0)
 		return 0;
 
 	rc = mhi_prepare_for_transfer(mhi_dev);

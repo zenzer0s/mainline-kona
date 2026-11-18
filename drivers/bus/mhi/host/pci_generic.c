@@ -31,6 +31,14 @@
 #define PCI_VENDOR_ID_QUECTEL	0x1eac
 #define PCI_VENDOR_ID_NETPRISMA	0x203e
 
+#if IS_ENABLED(CONFIG_PCIE_QCOM)
+int qcom_pcie_relink(struct pci_dev *pdev);
+int qcom_pcie_perst_toggle(struct pci_dev *pdev);
+#else
+static inline int qcom_pcie_relink(struct pci_dev *pdev) { return -ENODEV; }
+static inline int qcom_pcie_perst_toggle(struct pci_dev *pdev) { return -ENODEV; }
+#endif
+
 #define MHI_EDL_DB			91
 #define MHI_EDL_COOKIE			0xEDEDEDED
 
@@ -197,6 +205,36 @@ struct mhi_pci_dev_info {
 		.doorbell = MHI_DB_BRST_DISABLE,	\
 		.lpm_notify = false,			\
 		.offload_channel = false,		\
+		.doorbell_mode_switch = false,		\
+	}
+
+#define MHI_CHANNEL_CONFIG_OFFLOAD_UL(ch_num, ch_name, el_count, ev_ring) \
+	{						\
+		.num = ch_num,				\
+		.name = ch_name,			\
+		.num_elements = el_count,		\
+		.event_ring = ev_ring,			\
+		.dir = DMA_TO_DEVICE,			\
+		.ee_mask = BIT(MHI_EE_AMSS),		\
+		.pollcfg = 0,				\
+		.doorbell = MHI_DB_BRST_DISABLE,	\
+		.lpm_notify = false,			\
+		.offload_channel = true,		\
+		.doorbell_mode_switch = false,		\
+	}
+
+#define MHI_CHANNEL_CONFIG_OFFLOAD_DL(ch_num, ch_name, el_count, ev_ring) \
+	{						\
+		.num = ch_num,				\
+		.name = ch_name,			\
+		.num_elements = el_count,		\
+		.event_ring = ev_ring,			\
+		.dir = DMA_FROM_DEVICE,			\
+		.ee_mask = BIT(MHI_EE_AMSS),		\
+		.pollcfg = 0,				\
+		.doorbell = MHI_DB_BRST_DISABLE,	\
+		.lpm_notify = false,			\
+		.offload_channel = true,		\
 		.doorbell_mode_switch = false,		\
 	}
 
@@ -591,6 +629,8 @@ static const struct mhi_channel_config mhi_oneplus_sdx55_channels[] = {
 	MHI_CHANNEL_CONFIG_DL(21, "IPCR", 32, 0),
 	MHI_CHANNEL_CONFIG_UL(32, "DUN", 32, 0),
 	MHI_CHANNEL_CONFIG_DL(33, "DUN", 32, 0),
+	/* call audio: modem DMAs voice frames, host never moves data */
+	MHI_CHANNEL_CONFIG_OFFLOAD_UL(80, "AUDIO_VOICE_0", 64, 0),
 	MHI_CHANNEL_CONFIG_HW_UL(100, "IP_HW0", 128, 2),
 	MHI_CHANNEL_CONFIG_HW_DL(101, "IP_HW0", 128, 3),
 };
@@ -1486,6 +1526,29 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 	pci_set_power_state(pdev, PCI_D0);
 	pci_load_saved_state(pdev, mhi_pdev->pci_state);
 	pci_restore_state(pdev);
+
+	if (!mhi_pci_is_alive(mhi_cntrl) &&
+	    pdev->vendor == PCI_VENDOR_ID_QCOM) {
+		/*
+		 * The endpoint reset itself and dropped the link, so a
+		 * function-level reset cannot reach it. Rebuild the RC side
+		 * first; only if that fails fall back to cold-resetting the
+		 * modem through PERST# (it will boot its firmware again).
+		 */
+		dev_info(&pdev->dev,
+			 "device unreachable, rebuilding PCIe link\n");
+		err = qcom_pcie_relink(pdev);
+		if (err) {
+			dev_warn(&pdev->dev,
+				 "link rebuild failed (%d), trying PERST#\n",
+				 err);
+			err = qcom_pcie_perst_toggle(pdev);
+		}
+		if (!err) {
+			pci_load_saved_state(pdev, mhi_pdev->pci_state);
+			pci_restore_state(pdev);
+		}
+	}
 
 	if (!mhi_pci_is_alive(mhi_cntrl))
 		goto err_try_reset;
