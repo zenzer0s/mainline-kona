@@ -162,7 +162,7 @@
 };
 
 &slpi {
-	firmware-name = "slpi.mdt";
+	firmware-name = "qcom/sm8250/OnePlus/kebab/slpi.mbn";
 
 	status = "okay";
 };
