@@ -265,6 +265,8 @@ static int amb655x_unprepare(struct drm_panel *panel)
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 	regulator_bulk_disable(ARRAY_SIZE(amb655x_supplies), ctx->supplies);
 
+	usleep_range(70000, 70100);
+
 	return 0;
 }
 
