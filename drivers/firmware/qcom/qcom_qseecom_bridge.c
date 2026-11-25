@@ -7,6 +7,7 @@
  * the legacy listeners (RPMB, secure storage) those apps call back into.
  */
 #include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_tzmem.h>
 #include <linux/dma-mapping.h>
 #include <linux/kref.h>
 #include <linux/list.h>
@@ -88,6 +89,7 @@ struct qsee_listener {
 	void *sb;
 	dma_addr_t sb_phys;
 	size_t sb_len;
+	u64 sb_handle;
 	wait_queue_head_t wq;
 	bool req_pending;
 	bool rsp_ready;
@@ -106,6 +108,8 @@ static void qsee_listener_free(struct kref *ref)
 	struct qsee_listener *l = container_of(ref, struct qsee_listener, ref);
 
 	if (l->sb) {
+		if (l->sb_handle)
+			qcom_tzmem_shm_bridge_delete(l->sb_handle);
 		dma_unmap_single(qsee_bridge_dev.this_device, l->sb_phys, l->sb_len,
 				 DMA_BIDIRECTIONAL);
 		free_pages_exact(l->sb, l->sb_len);
@@ -230,15 +234,28 @@ static long qsee_bridge_listener_reg(struct file *file, void __user *argp)
 	 * Cached, with the maintenance stock does around each request, rather than an
 	 * uncached alias of memory TZ caches. Below 4G for the privileged listeners (RPMB).
 	 */
-	l->sb = alloc_pages_exact(r.sb_len, GFP_KERNEL | GFP_DMA | __GFP_ZERO);
+	l->sb_len = PAGE_ALIGN(r.sb_len);
+	l->sb = alloc_pages_exact(l->sb_len, GFP_KERNEL | GFP_DMA | __GFP_ZERO);
 	if (!l->sb) {
 		kfree(l);
 		return -ENOMEM;
 	}
-	l->sb_phys = dma_map_single(qsee_bridge_dev.this_device, l->sb, r.sb_len,
+	l->sb_phys = dma_map_single(qsee_bridge_dev.this_device, l->sb, l->sb_len,
 				    DMA_BIDIRECTIONAL);
+	if (dma_mapping_error(qsee_bridge_dev.this_device, l->sb_phys)) {
+		free_pages_exact(l->sb, l->sb_len);
+		kfree(l);
+		return -ENOMEM;
+	}
+	ret = qcom_tzmem_shm_bridge_create(l->sb_phys, l->sb_len, &l->sb_handle);
+	if (ret) {
+		dma_unmap_single(qsee_bridge_dev.this_device, l->sb_phys, l->sb_len,
+				 DMA_BIDIRECTIONAL);
+		free_pages_exact(l->sb, l->sb_len);
+		kfree(l);
+		return ret;
+	}
 	l->id = r.id;
-	l->sb_len = r.sb_len;
 	kref_init(&l->ref);
 	init_waitqueue_head(&l->wq);
 
@@ -252,7 +269,7 @@ static long qsee_bridge_listener_reg(struct file *file, void __user *argp)
 
 	args[0] = r.id;
 	args[1] = l->sb_phys;
-	args[2] = r.sb_len;
+	args[2] = l->sb_len;
 	/* The smcinvoke flavour, as stock: QTEE may then raise requests on QTEE invocations too */
 	ret = qcom_scm_qseecom_call_raw(QSEE_OWNER_QSEE_OS, QSEE_SVC_LISTENER,
 					QSEE_CMD_LISTENER_REG_SMCINVOKE,
@@ -349,27 +366,39 @@ struct qsee_tz_buf {
 	void *va;
 	dma_addr_t pa;
 	size_t len;
+	size_t alloc_len;
+	u64 handle;
 };
 
 static int qsee_tz_buf_get(struct qsee_tz_buf *b, size_t len, const void __user *src)
 {
 	struct device *dev = qsee_bridge_dev.this_device;
+	int ret;
 
 	b->len = len;
+	b->alloc_len = PAGE_ALIGN(len);
+	b->handle = 0;
 	/* QSEE takes only buffers below 4G (ZONE_DMA here) */
-	b->va = alloc_pages_exact(len, GFP_KERNEL | __GFP_ZERO | GFP_DMA);
+	b->va = alloc_pages_exact(b->alloc_len, GFP_KERNEL | __GFP_ZERO | GFP_DMA);
 	if (!b->va)
 		return -ENOMEM;
 	if (src && copy_from_user(b->va, src, len)) {
-		free_pages_exact(b->va, len);
+		free_pages_exact(b->va, b->alloc_len);
 		b->va = NULL;
 		return -EFAULT;
 	}
-	b->pa = dma_map_single(dev, b->va, len, DMA_BIDIRECTIONAL);
+	b->pa = dma_map_single(dev, b->va, b->alloc_len, DMA_BIDIRECTIONAL);
 	if (dma_mapping_error(dev, b->pa)) {
-		free_pages_exact(b->va, len);
+		free_pages_exact(b->va, b->alloc_len);
 		b->va = NULL;
 		return -ENOMEM;
+	}
+	ret = qcom_tzmem_shm_bridge_create(b->pa, b->alloc_len, &b->handle);
+	if (ret) {
+		dma_unmap_single(dev, b->pa, b->alloc_len, DMA_BIDIRECTIONAL);
+		free_pages_exact(b->va, b->alloc_len);
+		b->va = NULL;
+		return ret;
 	}
 	return 0;
 }
@@ -378,8 +407,12 @@ static void qsee_tz_buf_put(struct qsee_tz_buf *b)
 {
 	if (!b->va)
 		return;
-	dma_unmap_single(qsee_bridge_dev.this_device, b->pa, b->len, DMA_BIDIRECTIONAL);
-	free_pages_exact(b->va, b->len);
+	if (b->handle) {
+		qcom_tzmem_shm_bridge_delete(b->handle);
+		b->handle = 0;
+	}
+	dma_unmap_single(qsee_bridge_dev.this_device, b->pa, b->alloc_len, DMA_BIDIRECTIONAL);
+	free_pages_exact(b->va, b->alloc_len);
 	b->va = NULL;
 }
 
