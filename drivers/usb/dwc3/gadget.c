@@ -2712,6 +2712,7 @@ static int dwc3_gadget_soft_disconnect(struct dwc3 *dwc)
 	}
 
 	dwc->connected = false;
+	pm_relax(dwc->dev);
 
 	/*
 	 * Attempt to end pending SETUP status phase, and not wait for the
@@ -4117,6 +4118,7 @@ static void dwc3_gadget_disconnect_interrupt(struct dwc3 *dwc)
 	dwc3_gadget_dctl_write_safe(dwc, reg);
 
 	dwc->connected = false;
+	pm_relax(dwc->dev);
 
 	dwc3_disconnect_gadget(dwc);
 
@@ -4352,17 +4354,18 @@ static void dwc3_gadget_conndone_interrupt(struct dwc3 *dwc)
 	}
 
 	/*
-	 * Configure PHY via GUSB3PIPECTLn if required.
-	 *
-	 * Update GTXFIFOSIZn
-	 *
-	 * In both cases reset values should be sufficient.
+	 * Keep the system awake while actively enumerated by a USB data host
+	 * (e.g. ADB/MTP) so system suspend does not soft-disconnect the gadget.
+	 * Released on disconnect, USB bus suspend (U3), or gadget exit so
+	 * battery and wall-charger (DCP/PD) states enter deep sleep normally.
 	 */
+	pm_stay_awake(dwc->dev);
 }
 
 static void dwc3_gadget_wakeup_interrupt(struct dwc3 *dwc, unsigned int evtinfo)
 {
 	dwc->suspended = false;
+	pm_stay_awake(dwc->dev);
 
 	/*
 	 * TODO take core out of low power mode when that's
@@ -4504,6 +4507,7 @@ static void dwc3_gadget_suspend_interrupt(struct dwc3 *dwc,
 
 	if (!dwc->suspended && next == DWC3_LINK_STATE_U3) {
 		dwc->suspended = true;
+		pm_relax(dwc->dev);
 		dwc3_suspend_gadget(dwc);
 	}
 
@@ -4862,6 +4866,7 @@ void dwc3_gadget_exit(struct dwc3 *dwc)
 	if (!dwc->gadget)
 		return;
 
+	pm_relax(dwc->dev);
 	dwc3_enable_susphy(dwc, true);
 	usb_del_gadget(dwc->gadget);
 	dwc3_gadget_free_endpoints(dwc);

@@ -3,6 +3,7 @@
 // Copyright (c) 2018, Linaro Limited
 
 #include <linux/completion.h>
+#include <linux/wait.h>
 #include <linux/device.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
@@ -238,7 +239,8 @@ struct fastrpc_invoke_ctx {
 	u64 msg_sz;
 	struct kref refcount;
 	struct list_head node; /* list of ctxs */
-	struct completion work;
+	wait_queue_head_t wait;
+	bool done;
 	struct work_struct put_work;
 	struct fastrpc_msg msg;
 	struct fastrpc_user *fl;
@@ -665,7 +667,8 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 	ctx->pid = current->pid;
 	ctx->tgid = user->tgid;
 	ctx->cctx = cctx;
-	init_completion(&ctx->work);
+	init_waitqueue_head(&ctx->wait);
+	ctx->done = false;
 	INIT_WORK(&ctx->put_work, fastrpc_context_put_wq);
 
 	spin_lock(&user->lock);
@@ -1246,10 +1249,16 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 		goto bail;
 
 	if (kernel) {
-		if (!wait_for_completion_timeout(&ctx->work, 10 * HZ))
+		if (!wait_event_timeout(ctx->wait, READ_ONCE(ctx->done), 10 * HZ))
 			err = -ETIMEDOUT;
 	} else {
-		err = wait_for_completion_interruptible(&ctx->work);
+		/*
+		 * Use a freezable sleep so PM task freezing during system
+		 * suspend freezes reverse-RPC daemons (hexagonrpcd) in place
+		 * instead of interrupting the ioctl with -ERESTARTSYS and
+		 * crashing SLPI/ADSP on resume.
+		 */
+		err = wait_event_freezable(ctx->wait, READ_ONCE(ctx->done));
 	}
 
 	if (err)
@@ -2441,7 +2450,8 @@ static void fastrpc_notify_users(struct fastrpc_user *user)
 	spin_lock(&user->lock);
 	list_for_each_entry(ctx, &user->pending, node) {
 		ctx->retval = -EPIPE;
-		complete(&ctx->work);
+		WRITE_ONCE(ctx->done, true);
+		wake_up(&ctx->wait);
 	}
 	spin_unlock(&user->lock);
 }
@@ -2504,7 +2514,8 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	}
 
 	ctx->retval = rsp->retval;
-	complete(&ctx->work);
+	WRITE_ONCE(ctx->done, true);
+	wake_up(&ctx->wait);
 
 	/*
 	 * The DMA buffer associated with the context cannot be freed in

@@ -1103,6 +1103,7 @@ struct mhi_pci_device {
 	/* kebab SDX55: some MSIs are lost, so also poll the MHI vectors */
 	struct delayed_work poll_work;
 	bool poll_irqs;
+	bool poll_paused;
 	/* scratch page mapped at the MSI address in the device's IOMMU domain */
 	struct page *msi_sink;
 	unsigned long msi_sink_iova;
@@ -1164,11 +1165,13 @@ static void mhi_pci_poll(struct work_struct *work)
 	struct mhi_pci_device *mhi_pdev = container_of(to_delayed_work(work),
 						       struct mhi_pci_device, poll_work);
 
-	if (!test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) || !mhi_pdev->mhi_cntrl.bhi)
+	if (!test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) ||
+	    !mhi_pdev->mhi_cntrl.bhi || READ_ONCE(mhi_pdev->poll_paused))
 		return;
 
 	mhi_poll_irqs(&mhi_pdev->mhi_cntrl);
-	queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
+	if (!READ_ONCE(mhi_pdev->poll_paused))
+		queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
 }
 
 static void mhi_pci_start(struct mhi_pci_device *mhi_pdev);
@@ -1632,6 +1635,8 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 */
 	if (info == &mhi_oneplus_sdx55_info) {
 		mhi_pci_map_msi_sink(mhi_pdev, pdev);
+		if (pci_pme_capable(pdev, PCI_D3hot))
+			device_wakeup_enable(&pdev->dev);
 		mhi_pdev->poll_irqs = true;
 		mhi_pdev->fw_waiting = true;
 		mhi_pdev->fw_wait_left = 240;	/* 2 min, every 500 ms */
@@ -1840,6 +1845,10 @@ static int  __maybe_unused mhi_pci_runtime_suspend(struct device *dev)
 	}
 
 pci_suspend:
+	if (mhi_pdev->poll_irqs) {
+		WRITE_ONCE(mhi_pdev->poll_paused, true);
+		cancel_delayed_work_sync(&mhi_pdev->poll_work);
+	}
 	pci_disable_device(pdev);
 	pci_wake_from_d3(pdev, true);
 
@@ -1866,6 +1875,11 @@ static int __maybe_unused mhi_pci_runtime_resume(struct device *dev)
 	if (!test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) ||
 			mhi_cntrl->ee != MHI_EE_AMSS)
 		return 0; /* Nothing to do at MHI level */
+
+	if (mhi_pdev->poll_irqs) {
+		WRITE_ONCE(mhi_pdev->poll_paused, false);
+		queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
+	}
 
 	/* Exit M3, transition to M0 state */
 	err = mhi_pm_resume(mhi_cntrl);
