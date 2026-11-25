@@ -88,7 +88,7 @@
 #define MP2650_CTRL2_ADC_EN		0x3
 
 /* REG13: Status (RO) */
-#define MP2650_STAT_VIN_PG_N		BIT(1)
+#define MP2650_STAT_VIN_PG		BIT(1)
 #define MP2650_STAT_CHG_MASK		GENMASK(3, 2)
 #define MP2650_STAT_CHG_NONE		0
 #define MP2650_STAT_CHG_PRE		1
@@ -376,14 +376,14 @@ static int mp2650_get_property(struct power_supply *psy,
 		ret = regmap_read(chg->regmap, MP2650_REG_STAT, &regval);
 		if (ret)
 			return ret;
-		val->intval = !(regval & MP2650_STAT_VIN_PG_N);
+		val->intval = !!(regval & MP2650_STAT_VIN_PG);
 		return 0;
 
 	case POWER_SUPPLY_PROP_STATUS:
 		ret = regmap_read(chg->regmap, MP2650_REG_STAT, &regval);
 		if (ret)
 			return ret;
-		if (regval & MP2650_STAT_VIN_PG_N) {
+		if (!(regval & MP2650_STAT_VIN_PG)) {
 			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
 			return 0;
 		}
