@@ -60,6 +60,13 @@ config NFC_VIRTUAL_NCI
 
 	  If unsure, say N.
 
+config NFC_NQ_NCI
+	tristate "NXP/Qualcomm NCI NFC I2C character device driver (/dev/nq-nci)"
+	depends on I2C && GPIOLIB
+	help
+	  Say Y here to expose NXP SNxxx/PN5xx NCI NFC controllers as a
+	  /dev/nq-nci character device for Android NXP NFC HALs.
+
 source "drivers/nfc/fdp/Kconfig"
 source "drivers/nfc/pn544/Kconfig"
 source "drivers/nfc/pn533/Kconfig"
