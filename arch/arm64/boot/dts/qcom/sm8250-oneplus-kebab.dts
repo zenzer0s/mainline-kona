@@ -11,7 +11,7 @@
 };
 
 &adsp {
-	firmware-name = "qcom/sm8250/OnePlus/kebab/adsp.mbn";
+	firmware-name = "adsp.mdt";
 
 	status = "okay";
 };
@@ -23,7 +23,7 @@
 };
 
 &cdsp {
-	firmware-name = "qcom/sm8250/OnePlus/kebab/cdsp.mbn";
+	firmware-name = "cdsp.mdt";
 
 	status = "okay";
 };
@@ -165,7 +165,7 @@
 };
 
 &slpi {
-	firmware-name = "qcom/sm8250/OnePlus/kebab/slpi.mbn";
+	firmware-name = "slpi.mdt";
 
 	status = "okay";
 };
@@ -256,7 +256,7 @@
 };
 
 &venus {
-	firmware-name = "qcom/sm8250/OnePlus/kebab/venus.mbn";
+	firmware-name = "venus.mdt";
 
 	status = "okay";
 };
