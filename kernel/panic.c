@@ -576,11 +576,13 @@ void vpanic(const char *fmt, va_list args)
 		/*
 		 * This will not be a clean reboot, with everything
 		 * shutting down.  But if there is a chance of
-		 * rebooting the system it will be rebooted.
+		 * rebooting the system it will be rebooted into recovery.
 		 */
 		if (panic_reboot_mode != REBOOT_UNDEFINED)
 			reboot_mode = panic_reboot_mode;
-		emergency_restart();
+		kmsg_dump(KMSG_DUMP_EMERG);
+		system_state = SYSTEM_RESTART;
+		machine_restart("recovery");
 	}
 #ifdef __sparc__
 	{
