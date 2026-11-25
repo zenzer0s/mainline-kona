@@ -1813,9 +1813,17 @@ static int aw8695_probe(struct i2c_client *client)
 	if (err)
 		return dev_err_probe(dev, err, "Failed to read awinic,bemf-lower-threshold\n");
 
-	haptics->input_dev = devm_input_allocate_device(dev);
-	if (!haptics->input_dev)
-		return -ENOMEM;
+	haptics->client = client;
+	i2c_set_clientdata(client, haptics);
+
+	haptics->regmap = devm_regmap_init_i2c(client, &aw8695_regmap_config);
+	if (IS_ERR(haptics->regmap))
+		return dev_err_probe(dev, PTR_ERR(haptics->regmap),
+				     "Failed to allocate register map\n");
+
+	mutex_init(&haptics->lock);
+	mutex_init(&haptics->ioctl_lock);
+	haptics->f0 = haptics->f0_preset;
 
 	haptics->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(haptics->reset_gpio))
@@ -1826,6 +1834,24 @@ static int aw8695_probe(struct i2c_client *client)
 		IRQF_ONESHOT, NULL, haptics);
 	if (err)
 		return dev_err_probe(dev, err, "Failed to request interrupt\n");
+
+	err = aw8695_init(haptics);
+	if (err)
+		return dev_err_probe(dev, err, "Failed to init aw8695\n");
+
+	err = aw8695_ram_init(haptics);
+	if (err)
+		return dev_err_probe(dev, err, "Failed to init aw8695 sram\n");
+
+	err = aw8695_richtap_init(haptics);
+	if (!err)
+		return 0;
+
+	dev_warn(dev, "RichTap init failed (%d), falling back to input-ff\n", err);
+
+	haptics->input_dev = devm_input_allocate_device(dev);
+	if (!haptics->input_dev)
+		return -ENOMEM;
 
 	INIT_WORK(&haptics->play_work, aw8695_haptics_play_work);
 
@@ -1839,30 +1865,6 @@ static int aw8695_probe(struct i2c_client *client)
 				      aw8695_haptics_play);
 	if (err)
 		return dev_err_probe(dev, err, "Failed to create FF dev\n");
-
-	haptics->client = client;
-	i2c_set_clientdata(client, haptics);
-
-	haptics->regmap = devm_regmap_init_i2c(client, &aw8695_regmap_config);
-	if (IS_ERR(haptics->regmap))
-		return dev_err_probe(dev, PTR_ERR(haptics->regmap),
-				     "Failed to allocate register map\n");
-
-	mutex_init(&haptics->lock);
-	mutex_init(&haptics->ioctl_lock);
-	haptics->f0 = haptics->f0_preset;
-
-	err = aw8695_init(haptics);
-	if (err)
-		return dev_err_probe(dev, err, "Failed to init aw8695\n");
-
-	err = aw8695_ram_init(haptics);
-	if (err)
-		return dev_err_probe(dev, err, "Failed to init aw8695 sram\n");
-
-	err = aw8695_richtap_init(haptics);
-	if (err)
-		dev_warn(dev, "RichTap init failed (%d), continuing with input-ff only\n", err);
 
 	err = input_register_device(haptics->input_dev);
 	if (err)
