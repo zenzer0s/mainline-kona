@@ -39,6 +39,7 @@
 #include <linux/pm_qos.h>
 #include <linux/cpufreq.h>
 #include <linux/pm_wakeup.h>
+#include <linux/proc_fs.h>
 #include "gf_spi.h"
 
 #if defined(USE_SPI_BUS)
@@ -70,6 +71,42 @@ static LIST_HEAD(device_list);
 static DEFINE_MUTEX(device_list_lock);
 static struct wakeup_source *fp_ws;
 static struct gf_dev gf;
+static struct proc_dir_entry *tp_proc_dir;
+static struct proc_dir_entry *tp_fp_enable_entry;
+static int tp_fp_enable_state;
+
+static ssize_t tp_fp_enable_read(struct file *file, char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	char tmp[8];
+	int len = scnprintf(tmp, sizeof(tmp), "%d\n", tp_fp_enable_state);
+
+	return simple_read_from_buffer(buf, count, ppos, tmp, len);
+}
+
+static ssize_t tp_fp_enable_write(struct file *file, const char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	char tmp[8];
+	int val = 0;
+
+	if (!count)
+		return 0;
+	if (count >= sizeof(tmp))
+		count = sizeof(tmp) - 1;
+	if (copy_from_user(tmp, buf, count))
+		return -EFAULT;
+	tmp[count] = '\0';
+	if (kstrtoint(strim(tmp), 10, &val) == 0)
+		tp_fp_enable_state = val;
+	return count;
+}
+
+static const struct proc_ops tp_fp_enable_proc_ops = {
+	.proc_read = tp_fp_enable_read,
+	.proc_write = tp_fp_enable_write,
+	.proc_lseek = default_llseek,
+};
 
 static struct gf_key_map maps[] = {
 	{ EV_KEY, GF_KEY_INPUT_HOME },
@@ -886,6 +923,10 @@ static int __init gf_init(void)
 #ifdef GF_NETLINK_ENABLE
 	netlink_init();
 #endif
+	tp_proc_dir = proc_mkdir("touchpanel", NULL);
+	if (tp_proc_dir)
+		tp_fp_enable_entry = proc_create("fp_enable", 0666, tp_proc_dir,
+						 &tp_fp_enable_proc_ops);
 	pr_info("status = 0x%x\n", status);
 	return 0;
 }
@@ -893,6 +934,14 @@ module_init(gf_init);
 
 static void __exit gf_exit(void)
 {
+	if (tp_fp_enable_entry) {
+		proc_remove(tp_fp_enable_entry);
+		tp_fp_enable_entry = NULL;
+	}
+	if (tp_proc_dir) {
+		proc_remove(tp_proc_dir);
+		tp_proc_dir = NULL;
+	}
 #ifdef GF_NETLINK_ENABLE
 	netlink_exit();
 #endif
