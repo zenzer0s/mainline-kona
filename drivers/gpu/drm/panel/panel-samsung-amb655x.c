@@ -190,7 +190,6 @@ static int amb655x_on(struct amb655x *ctx)
 static int amb655x_enable(struct drm_panel *panel)
 {
 	struct amb655x *ctx = to_amb655x(panel);
-	struct device *dev = &ctx->dsi->dev;
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
 
 	mipi_dsi_msleep(&dsi_ctx, 110);
