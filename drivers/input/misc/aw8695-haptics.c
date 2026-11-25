@@ -569,6 +569,7 @@ struct aw8695_data {
 	u32 f0;
 	u8 f0_cali_lra;
 	/* AAC RichTap /dev/awinic_haptic streaming state */
+	struct mutex ioctl_lock;
 	struct miscdevice miscdev;
 	struct workqueue_struct *rtp_wq;
 	struct work_struct haptic_rtp_work;
@@ -802,11 +803,12 @@ static void aw8695_close(struct input_dev *input)
 {
 	struct aw8695_data *haptics = input_get_drvdata(input);
 	struct device *dev = &haptics->client->dev;
-	int err;
+	int err = 0;
 
 	cancel_work_sync(&haptics->play_work);
 	mutex_lock(&haptics->lock);
-	err = aw8695_haptics_stop(haptics);
+	if (!haptics->haptic_rtp_mode)
+		err = aw8695_haptics_stop(haptics);
 	mutex_unlock(&haptics->lock);
 	if (err)
 		dev_err(dev, "Failed to stop haptics: %d\n", err);
@@ -817,13 +819,15 @@ static void aw8695_haptics_play_work(struct work_struct *work)
 	struct aw8695_data *haptics =
 		container_of(work, struct aw8695_data, play_work);
 	struct device *dev = &haptics->client->dev;
-	int err;
+	int err = 0;
 
 	mutex_lock(&haptics->lock);
-	if (haptics->running)
-		err = aw8695_haptics_start(haptics);
-	else
-		err = aw8695_haptics_stop(haptics);
+	if (!haptics->haptic_rtp_mode) {
+		if (haptics->running)
+			err = aw8695_haptics_start(haptics);
+		else
+			err = aw8695_haptics_stop(haptics);
+	}
 	mutex_unlock(&haptics->lock);
 
 	if (err)
@@ -1399,15 +1403,13 @@ static int aw8695_rtp_write(struct aw8695_data *haptics, const u8 *buf, size_t l
 
 static void aw8695_richtap_clean_buf(struct aw8695_data *haptics, u8 status)
 {
-	struct mmap_buf_format *opbuf = haptics->start_buf;
 	int i;
 
-	if (!opbuf)
+	if (!haptics->start_buf)
 		return;
-	for (i = 0; i < RICHTAP_MMAP_BUF_SUM; i++) {
-		opbuf->status = status;
-		opbuf = opbuf->kernel_next;
-	}
+	/* Never follow user-writable kernel_next pointers; index the ring directly */
+	for (i = 0; i < RICHTAP_MMAP_BUF_SUM; i++)
+		haptics->start_buf[i].status = status;
 	smp_mb();
 }
 
@@ -1416,10 +1418,12 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 	struct aw8695_data *haptics =
 		container_of(work, struct aw8695_data, haptic_rtp_work);
 	struct device *dev = &haptics->client->dev;
-	struct mmap_buf_format *opbuf = haptics->start_buf;
+	unsigned int idx = 0;
+	struct mmap_buf_format *opbuf = &haptics->start_buf[idx];
 	unsigned int sysst = AW8695_SYSST_FF_AES;
 	int wait_ms = 100;
 	bool started = false;
+	bool timed_out = false;
 	ktime_t t_start;
 
 	while (wait_ms-- > 0 && !atomic_read(&haptics->done_flag)) {
@@ -1427,8 +1431,10 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 		if (opbuf->status == MMAP_BUF_DATA_VALID) {
 			mutex_lock(&haptics->lock);
 			if (!atomic_read(&haptics->done_flag)) {
+				/* Keep FF_AEI masked: this loop polls SYSST directly */
+				aw8695_haptic_set_rtp_aei(haptics, false);
+				regmap_write(haptics->regmap, AW8695_TRIM_LRA, 0x00);
 				aw8695_set_work_mode(haptics, AW8695_RTP_MODE);
-				aw8695_haptic_set_rtp_aei(haptics, true);
 				aw8695_interrupt_clear(haptics);
 				regmap_update_bits(haptics->regmap, AW8695_GO,
 						   AW8695_GO_ENABLE, AW8695_GO_ENABLE);
@@ -1451,6 +1457,7 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 	while (!atomic_read(&haptics->done_flag)) {
 		if (ktime_us_delta(ktime_get(), t_start) > 800000) {
 			dev_warn(dev, "RichTap RTP stream timeout\n");
+			timed_out = true;
 			break;
 		}
 		smp_rmb();
@@ -1466,23 +1473,31 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 			if (len > 0) {
 				if (len > RICHTAP_MMAP_BUF_SIZE)
 					len = RICHTAP_MMAP_BUF_SIZE;
+				mutex_lock(&haptics->lock);
 				aw8695_rtp_write(haptics, opbuf->data, len);
+				mutex_unlock(&haptics->lock);
 				memset(opbuf->data, 0, len);
 			}
 			smp_wmb();
 			opbuf->status = MMAP_BUF_DATA_INVALID;
 			smp_mb();
-			opbuf = opbuf->kernel_next;
+			idx = (idx + 1) % RICHTAP_MMAP_BUF_SUM;
+			opbuf = &haptics->start_buf[idx];
 			t_start = ktime_get();
 		} else {
 			usleep_range(800, 1200);
 		}
-		if (regmap_read(haptics->regmap, AW8695_SYSST, &sysst))
+		if (regmap_read(haptics->regmap, AW8695_SYSST, &sysst)) {
+			timed_out = true;
 			break;
+		}
 	}
 
 	mutex_lock(&haptics->lock);
 	aw8695_haptic_set_rtp_aei(haptics, false);
+	if (timed_out || atomic_read(&haptics->done_flag))
+		aw8695_haptics_stop(haptics);
+	regmap_write(haptics->regmap, AW8695_TRIM_LRA, haptics->f0_cali_lra);
 	haptics->haptic_rtp_mode = false;
 	mutex_unlock(&haptics->lock);
 }
@@ -1538,6 +1553,7 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 		return ret;
 
 	case RICHTAP_RTP_MODE:
+		mutex_lock(&haptics->ioctl_lock);
 		atomic_set(&haptics->done_flag, 1);
 		aw8695_richtap_clean_buf(haptics, MMAP_BUF_DATA_FINISHED);
 		cancel_work_sync(&haptics->haptic_rtp_work);
@@ -1549,24 +1565,29 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 				   RICHTAP_MMAP_BUF_SIZE * RICHTAP_MMAP_BUF_SUM)) {
 			ret = -EFAULT;
 			mutex_unlock(&haptics->lock);
+			mutex_unlock(&haptics->ioctl_lock);
 			return ret;
 		}
 		tmp = *(u32 *)haptics->rtp_ptr;
 		if (tmp > (RICHTAP_MMAP_BUF_SIZE * RICHTAP_MMAP_BUF_SUM - 4)) {
 			dev_err(dev, "RichTap RTP length invalid: %u\n", tmp);
 			mutex_unlock(&haptics->lock);
+			mutex_unlock(&haptics->ioctl_lock);
 			return -EINVAL;
 		}
 		aw8695_haptic_set_bst_vol(haptics, 0x11);
+		regmap_write(haptics->regmap, AW8695_TRIM_LRA, 0x00);
 		aw8695_set_work_mode(haptics, AW8695_RTP_MODE);
 		regmap_update_bits(haptics->regmap, AW8695_GO,
 				   AW8695_GO_ENABLE, AW8695_GO_ENABLE);
 		usleep_range(2000, 2500);
 		ret = aw8695_rtp_write(haptics, &haptics->rtp_ptr[4], tmp);
 		mutex_unlock(&haptics->lock);
+		mutex_unlock(&haptics->ioctl_lock);
 		return ret;
 
 	case RICHTAP_STREAM_MODE:
+		mutex_lock(&haptics->ioctl_lock);
 		atomic_set(&haptics->done_flag, 1);
 		aw8695_richtap_clean_buf(haptics, MMAP_BUF_DATA_FINISHED);
 		cancel_work_sync(&haptics->haptic_rtp_work);
@@ -1579,9 +1600,11 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 		aw8695_haptic_set_bst_vol(haptics, 0x11);
 		queue_work(haptics->rtp_wq, &haptics->haptic_rtp_work);
 		mutex_unlock(&haptics->lock);
+		mutex_unlock(&haptics->ioctl_lock);
 		return 0;
 
 	case RICHTAP_STOP_MODE:
+		mutex_lock(&haptics->ioctl_lock);
 		atomic_set(&haptics->done_flag, 1);
 		aw8695_richtap_clean_buf(haptics, MMAP_BUF_DATA_FINISHED);
 		cancel_work_sync(&haptics->haptic_rtp_work);
@@ -1589,8 +1612,10 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 		mutex_lock(&haptics->lock);
 		aw8695_haptic_set_rtp_aei(haptics, false);
 		aw8695_haptics_stop(haptics);
+		regmap_write(haptics->regmap, AW8695_TRIM_LRA, haptics->f0_cali_lra);
 		haptics->haptic_rtp_mode = false;
 		mutex_unlock(&haptics->lock);
+		mutex_unlock(&haptics->ioctl_lock);
 		return 0;
 
 	default:
@@ -1605,11 +1630,12 @@ static int aw8695_richtap_mmap(struct file *filp, struct vm_area_struct *vma)
 	unsigned long size = vma->vm_end - vma->vm_start;
 	unsigned long phys;
 
-	if (size != (PAGE_SIZE << RICHTAP_MMAP_PAGE_ORDER))
+	if (vma->vm_pgoff != 0 || size != (PAGE_SIZE << RICHTAP_MMAP_PAGE_ORDER))
 		return -EINVAL;
 	if (!(vma->vm_flags & VM_SHARED))
 		return -EPERM;
 
+	vm_flags_set(vma, VM_DONTDUMP | VM_DONTEXPAND);
 	phys = virt_to_phys(haptics->start_buf);
 	return remap_pfn_range(vma, vma->vm_start, phys >> PAGE_SHIFT,
 			       size, vma->vm_page_prot);
@@ -1823,6 +1849,7 @@ static int aw8695_probe(struct i2c_client *client)
 				     "Failed to allocate register map\n");
 
 	mutex_init(&haptics->lock);
+	mutex_init(&haptics->ioctl_lock);
 	haptics->f0 = haptics->f0_preset;
 
 	err = aw8695_init(haptics);
