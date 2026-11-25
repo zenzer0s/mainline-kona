@@ -12,9 +12,12 @@
 	reserved-memory {
 		/*
 		 * Default CMA area for QTEE trusted app images and shared buffers.
+		 * Keep below 4 GiB so legacy 32-bit QSEECom TAs (e.g. Goodix FP)
+		 * can embed physical addresses with is64 = 0.
 		 */
 		linux,cma {
 			compatible = "shared-dma-pool";
+			alloc-ranges = <0x0 0x80000000 0x0 0x80000000>;
 			size = <0x0 0x10000000>;
 			reusable;
 			linux,cma-default;
