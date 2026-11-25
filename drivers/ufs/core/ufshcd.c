@@ -9480,6 +9480,136 @@ static struct ufs_hba_variant_params ufs_hba_vps = {
 	.ondemand_data.downdifferential	= 5,
 };
 
+#define UFS_IOCTL_QUERY 0x5388
+
+struct ufs_ioctl_query_data {
+	__u32 opcode;
+	__u8 idn;
+	__u16 buf_size;
+	__u8 buffer[];
+};
+
+static int ufshcd_query_ioctl(struct ufs_hba *hba, u8 lun, void __user *buffer)
+{
+	struct ufs_ioctl_query_data *ioctl_data;
+	int err = 0;
+	int length = 0;
+	void *data_ptr = NULL;
+	bool flag = false;
+	u32 att = 0;
+	u8 index = 0;
+	u8 *desc = NULL;
+
+	ioctl_data = kzalloc(sizeof(*ioctl_data), GFP_KERNEL);
+	if (!ioctl_data)
+		return -ENOMEM;
+
+	if (copy_from_user(ioctl_data, buffer, sizeof(*ioctl_data))) {
+		err = -EFAULT;
+		goto out_release_mem;
+	}
+
+	switch (ioctl_data->opcode) {
+	case UPIU_QUERY_OPCODE_READ_DESC:
+		switch (ioctl_data->idn) {
+		case QUERY_DESC_IDN_DEVICE:
+		case QUERY_DESC_IDN_CONFIGURATION:
+		case QUERY_DESC_IDN_INTERCONNECT:
+		case QUERY_DESC_IDN_GEOMETRY:
+		case QUERY_DESC_IDN_POWER:
+		case QUERY_DESC_IDN_HEALTH:
+			index = 0;
+			break;
+		case QUERY_DESC_IDN_UNIT:
+			if (!ufs_is_valid_unit_desc_lun(&hba->dev_info, lun)) {
+				err = -EINVAL;
+				goto out_release_mem;
+			}
+			index = lun;
+			break;
+		default:
+			err = -EINVAL;
+			goto out_release_mem;
+		}
+		length = min_t(int, QUERY_DESC_MAX_SIZE, ioctl_data->buf_size);
+		if (length < QUERY_DESC_MIN_SIZE) {
+			err = -EINVAL;
+			goto out_release_mem;
+		}
+		desc = kzalloc(length, GFP_KERNEL);
+		if (!desc) {
+			err = -ENOMEM;
+			goto out_release_mem;
+		}
+		err = ufshcd_query_descriptor_retry(hba, ioctl_data->opcode,
+						    ioctl_data->idn, index, 0,
+						    desc, &length);
+		break;
+	case UPIU_QUERY_OPCODE_READ_ATTR:
+		index = (ioctl_data->idn == QUERY_ATTR_IDN_DYN_CAP_NEEDED ||
+			 ioctl_data->idn == QUERY_ATTR_IDN_CORR_PRG_BLK_NUM) ?
+			lun : 0;
+		err = ufshcd_query_attr_retry(hba, ioctl_data->opcode,
+					      ioctl_data->idn, index, 0, &att);
+		break;
+	case UPIU_QUERY_OPCODE_READ_FLAG:
+		err = ufshcd_query_flag_retry(hba, ioctl_data->opcode,
+					      ioctl_data->idn, 0, &flag);
+		break;
+	default:
+		err = -EINVAL;
+		goto out_release_mem;
+	}
+
+	if (err)
+		goto out_release_mem;
+
+	switch (ioctl_data->opcode) {
+	case UPIU_QUERY_OPCODE_READ_DESC:
+		ioctl_data->buf_size = min_t(int, ioctl_data->buf_size, length);
+		data_ptr = desc;
+		break;
+	case UPIU_QUERY_OPCODE_READ_ATTR:
+		ioctl_data->buf_size = sizeof(u32);
+		data_ptr = &att;
+		break;
+	case UPIU_QUERY_OPCODE_READ_FLAG:
+		ioctl_data->buf_size = 1;
+		data_ptr = &flag;
+		break;
+	}
+
+	if (copy_to_user(buffer, ioctl_data, sizeof(*ioctl_data)) ||
+	    copy_to_user(buffer + sizeof(*ioctl_data), data_ptr,
+			 ioctl_data->buf_size))
+		err = -EFAULT;
+
+out_release_mem:
+	kfree(ioctl_data);
+	kfree(desc);
+	return err;
+}
+
+static int ufshcd_ioctl(struct scsi_device *dev, unsigned int cmd,
+			void __user *buffer)
+{
+	struct ufs_hba *hba = shost_priv(dev->host);
+	int err;
+
+	switch (cmd) {
+	case UFS_IOCTL_QUERY:
+		if (!buffer)
+			return -EINVAL;
+		ufshcd_rpm_get_sync(hba);
+		err = ufshcd_query_ioctl(hba, ufshcd_scsi_to_upiu_lun(dev->lun),
+					 buffer);
+		ufshcd_rpm_put_sync(hba);
+		return err;
+	default:
+		return -ENOIOCTLCMD;
+	}
+}
+
 static const struct scsi_host_template ufshcd_driver_template = {
 	.module			= THIS_MODULE,
 	.name			= UFSHCD,
@@ -9495,6 +9625,10 @@ static const struct scsi_host_template ufshcd_driver_template = {
 	.eh_device_reset_handler = ufshcd_eh_device_reset_handler,
 	.eh_host_reset_handler   = ufshcd_eh_host_reset_handler,
 	.eh_timed_out		= ufshcd_eh_timed_out,
+	.ioctl			= ufshcd_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl		= ufshcd_ioctl,
+#endif
 	.this_id		= -1,
 	.sg_tablesize		= SG_ALL,
 	.max_segment_size	= PRDT_DATA_BYTE_COUNT_MAX,
