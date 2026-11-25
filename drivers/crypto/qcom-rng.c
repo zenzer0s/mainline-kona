@@ -90,6 +90,8 @@ static void qcom_hwrng_cleanup(struct hwrng *hwrng)
 	clk_disable_unprepare(qrng->clk);
 }
 
+static struct qcom_rng_match_data qcom_trng_match_data;
+
 static int qcom_rng_probe(struct platform_device *pdev)
 {
 	const struct qcom_rng_match_data *match_data;
@@ -122,7 +124,8 @@ static int qcom_rng_probe(struct platform_device *pdev)
 	rng->hwrng.init = qcom_hwrng_init;
 	rng->hwrng.read = qcom_hwrng_read;
 	rng->hwrng.cleanup = qcom_hwrng_cleanup;
-	rng->hwrng.quality = QCOM_TRNG_QUALITY;
+	rng->hwrng.quality = match_data == &qcom_trng_match_data ?
+			     QCOM_TRNG_QUALITY : 0;
 	ret = devm_hwrng_register(&pdev->dev, &rng->hwrng);
 	if (ret)
 		dev_err(&pdev->dev, "Register hwrng failed: %d\n", ret);
@@ -133,8 +136,14 @@ static struct qcom_rng_match_data qcom_prng_match_data = {
 	.hwrng_support = false,
 };
 
+/*
+ * The PRNG EE frame (sm8250 and others) reads through the same data/status
+ * registers as the TRNG, so expose it as a hwrng too: Android's prng_seeder
+ * needs /dev/hw_random and hangs at boot without one. It is a DRBG, so it
+ * is registered without entropy credit (quality 0).
+ */
 static struct qcom_rng_match_data qcom_prng_ee_match_data = {
-	.hwrng_support = false,
+	.hwrng_support = true,
 };
 
 static struct qcom_rng_match_data qcom_trng_match_data = {
