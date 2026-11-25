@@ -52,6 +52,7 @@ struct nq_nci_dev {
 	bool irq_enabled;
 	bool irq_pending;
 	bool read_pending;
+	bool read_aborted;
 	u8 rx_buf[NQ_NCI_MAX_BUFFER_SIZE];
 	u8 tx_buf[NQ_NCI_MAX_BUFFER_SIZE];
 };
@@ -101,8 +102,26 @@ static int nq_nci_open(struct inode *inode, struct file *filp)
 {
 	struct miscdevice *misc = filp->private_data;
 	struct nq_nci_dev *nq = container_of(misc, struct nq_nci_dev, miscdev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&nq->irq_lock, flags);
+	nq->read_aborted = false;
+	spin_unlock_irqrestore(&nq->irq_lock, flags);
 
 	filp->private_data = nq;
+	return 0;
+}
+
+static int nq_nci_flush(struct file *filp, fl_owner_t id)
+{
+	struct nq_nci_dev *nq = filp->private_data;
+	unsigned long flags;
+
+	spin_lock_irqsave(&nq->irq_lock, flags);
+	nq->read_aborted = true;
+	spin_unlock_irqrestore(&nq->irq_lock, flags);
+	wake_up_interruptible(&nq->read_wq);
+
 	return 0;
 }
 
@@ -155,10 +174,15 @@ static ssize_t nq_nci_read(struct file *filp, char __user *buf,
 		}
 		spin_unlock_irqrestore(&nq->irq_lock, flags);
 
-		ret = wait_event_interruptible(nq->read_wq, nq->irq_pending);
+		ret = wait_event_interruptible(nq->read_wq,
+					       nq->irq_pending || nq->read_aborted);
 		if (ret) {
 			mutex_unlock(&nq->read_mutex);
 			return ret;
+		}
+		if (nq->read_aborted) {
+			mutex_unlock(&nq->read_mutex);
+			return -ECANCELED;
 		}
 	}
 
@@ -295,6 +319,7 @@ static long nq_nci_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 static const struct file_operations nq_nci_fops = {
 	.owner = THIS_MODULE,
 	.open = nq_nci_open,
+	.flush = nq_nci_flush,
 	.release = nq_nci_release,
 	.poll = nq_nci_poll,
 	.read = nq_nci_read,
