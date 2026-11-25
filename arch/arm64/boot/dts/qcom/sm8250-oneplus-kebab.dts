@@ -219,9 +219,10 @@
 };
 
 &battery {
-	charge-full-design-microamp-hours = <4500000>;
+	/* Dual-cell 2S pack (2x 2250 mAh in series, 8.70 V max, 19.575 Wh) */
+	charge-full-design-microamp-hours = <2250000>;
 	energy-full-design-microwatt-hours = <19575000>;
-	voltage-max-design-microvolt = <4350000>;
+	voltage-max-design-microvolt = <8700000>;
 };
 
 &cdsp {
@@ -327,6 +328,22 @@
 	};
 };
 
+&i2c5 {
+	clock-frequency = <400000>;
+
+	status = "okay";
+
+	charger@5c {
+		compatible = "mps,mp2650";
+		reg = <0x5c>;
+		monitored-battery = <&battery>;
+		constant-charge-voltage-max-microvolt = <8700000>;
+		constant-charge-current-max-microamp = <3000000>;
+		input-current-limit-microamp = <3000000>;
+		otg-enable-gpios = <&pm8150_gpios 3 GPIO_ACTIVE_HIGH>;
+	};
+};
+
 &i2c13 {
 	clock-frequency = <400000>;
 
@@ -364,6 +381,17 @@
 
 &panel_vout_suspend {
 	pins = "gpio24";
+};
+
+&pm8150b_typec {
+	connector {
+		op-sink-microwatt = <27000000>;
+		sink-pdos = <PDO_FIXED(5000, 3000,
+			     PDO_FIXED_DUAL_ROLE |
+			     PDO_FIXED_USB_COMM |
+			     PDO_FIXED_DATA_SWAP)>,
+			    <PDO_FIXED(9000, 3000, 0)>;
+	};
 };
 
 &pm8150_adc {
