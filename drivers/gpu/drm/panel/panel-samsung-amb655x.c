@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/regulator/consumer.h>
 #include <linux/sysfs.h>
+#include <linux/goodix_fp_notify.h>
 
 #include <video/mipi_display.h>
 
@@ -208,6 +209,9 @@ static int amb655x_enable(struct drm_panel *panel)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_ENTER_NORMAL_MODE);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x9f, 0xa5, 0xa5);
 
+	if (!dsi_ctx.accum_err)
+		gf_notify_screen_state(true);
+
 	return dsi_ctx.accum_err;
 }
 
@@ -276,6 +280,8 @@ static int amb655x_unprepare(struct drm_panel *panel)
 	ctx->prepared = false;
 	ctx->hbm = false;
 	mutex_unlock(&ctx->lock);
+
+	gf_notify_screen_state(false);
 
 	ret = amb655x_off(ctx);
 	if (ret < 0)
@@ -367,12 +373,14 @@ static int amb655x_set_hbm(struct amb655x *ctx, bool enable)
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0xe0);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x51, 0x0c, 0xa8);
+		mipi_dsi_msleep(&dsi_ctx, 25);
 	} else {
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x4c);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0x20);
+		mipi_dsi_msleep(&dsi_ctx, 32);
 		if (!dsi_ctx.accum_err)
 			mipi_dsi_dcs_set_display_brightness_large(dsi, ctx->saved_brightness);
 	}
@@ -417,7 +425,27 @@ static ssize_t notify_fppress_show(struct kobject *kobj, struct kobj_attribute *
 static ssize_t notify_fppress_store(struct kobject *kobj, struct kobj_attribute *attr,
 				    const char *buf, size_t count)
 {
-	return hbm_store(kobj, attr, buf, count);
+	struct amb655x *ctx = g_amb655x_ctx;
+	unsigned int val;
+	int ret;
+
+	if (!ctx)
+		return -ENODEV;
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+	if (val) {
+		ret = amb655x_set_hbm(ctx, true);
+		if (ret)
+			return ret;
+		gf_notify_ui_ready(true);
+	} else {
+		gf_notify_ui_ready(false);
+		ret = amb655x_set_hbm(ctx, false);
+		if (ret)
+			return ret;
+	}
+	return count;
 }
 
 static struct kobj_attribute amb655x_hbm_attr = __ATTR_RW(hbm);

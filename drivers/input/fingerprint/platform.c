@@ -152,14 +152,15 @@ int gf_power_on(struct gf_dev *gf_dev)
 	if (IS_ERR_OR_NULL(gf_dev->vdd))
 		return -ENODEV;
 	if (!gf_dev->vdd_on) {
+		regulator_set_load(gf_dev->vdd, 150000);
 		rc = regulator_enable(gf_dev->vdd);
 		if (rc) {
 			pr_err("Regulator enable failed rc=%d\n", rc);
 			goto err_reg;
 		}
 		gf_dev->vdd_on = true;
+		msleep(30);
 	}
-	/* TODO: add your power control here */
 	return rc;
 err_reg:
 	return rc;
@@ -173,9 +174,8 @@ int gf_power_off(struct gf_dev *gf_dev)
 	if (!IS_ERR_OR_NULL(gf_dev->vdd) && gf_dev->vdd_on) {
 		rc = regulator_disable(gf_dev->vdd);
 		gf_dev->vdd_on = false;
+		msleep(30);
 	}
-
-	/* TODO: add your power control here */
 
 	return rc;
 }
@@ -186,11 +186,26 @@ int gf_hw_reset(struct gf_dev *gf_dev, unsigned int delay_ms)
 		pr_info("Input buff is NULL.\n");
 		return -1;
 	}
-	//gpio_direction_output(gf_dev->reset_gpio, 1);
 	gpio_set_value(gf_dev->reset_gpio, 0);
-	usleep_range(11000,11000);
+	usleep_range(5000, 6000);
 	gpio_set_value(gf_dev->reset_gpio, 1);
-	mdelay(delay_ms);
+	if (delay_ms)
+		mdelay(delay_ms);
+	return 0;
+}
+
+int gf_power_reset(struct gf_dev *gf_dev)
+{
+	if (gf_dev == NULL) {
+		pr_info("Input buff is NULL.\n");
+		return -1;
+	}
+	gpio_set_value(gf_dev->reset_gpio, 0);
+	gf_power_off(gf_dev);
+	msleep(50);
+	gf_power_on(gf_dev);
+	gpio_set_value(gf_dev->reset_gpio, 1);
+	mdelay(3);
 	return 0;
 }
 

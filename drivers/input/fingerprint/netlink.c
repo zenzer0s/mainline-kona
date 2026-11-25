@@ -25,7 +25,7 @@ int sendnlmsg(char *msg)
 	int len = NLMSG_SPACE(MAX_MSGSIZE);
 	int ret = 0;
 
-	if (!msg || !nl_sk || !pid)
+	if (!msg || !nl_sk || pid <= 0)
 		return -ENODEV;
 
 	skb = alloc_skb(len, GFP_ATOMIC);

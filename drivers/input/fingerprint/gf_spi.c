@@ -40,6 +40,7 @@
 #include <linux/cpufreq.h>
 #include <linux/pm_wakeup.h>
 #include <linux/proc_fs.h>
+#include <linux/goodix_fp_notify.h>
 #include "gf_spi.h"
 
 #if defined(USE_SPI_BUS)
@@ -476,7 +477,7 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 	case GF_IOC_RESET:
 		pr_debug("%s GF_IOC_RESET\n", __func__);
-		gf_hw_reset(gf_dev, 3);
+		gf_hw_reset(gf_dev, 10);
 		break;
 
 	case GF_IOC_INPUT_KEY_EVENT:
@@ -557,10 +558,7 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 	case GF_IOC_POWER_RESET:
 		pr_debug("%s GF_IOC_POWER_RESET\n", __func__);
-		gf_power_off(gf_dev);
-		msleep(10);
-		gf_power_on(gf_dev);
-		gf_hw_reset(gf_dev, 3);
+		gf_power_reset(gf_dev);
 		gf_dev->device_available = 1;
 		break;
 
@@ -702,6 +700,31 @@ static int gf_release(struct inode *inode, struct file *filp)
 	mutex_unlock(&device_list_lock);
 	return status;
 }
+
+void gf_notify_ui_ready(bool ready)
+{
+#ifdef GF_NETLINK_ENABLE
+	char msg = ready ? GF_NET_EVENT_UI_READY : GF_NET_EVENT_UI_DISAPPEAR;
+
+	pr_info("%s: %s\n", __func__, ready ? "UI_READY" : "UI_DISAPPEAR");
+	sendnlmsg(&msg);
+#endif
+}
+EXPORT_SYMBOL_GPL(gf_notify_ui_ready);
+
+void gf_notify_screen_state(bool on)
+{
+	struct gf_dev *gf_dev = &gf;
+#ifdef GF_NETLINK_ENABLE
+	char msg = on ? GF_NET_EVENT_FB_UNBLACK : GF_NET_EVENT_FB_BLACK;
+
+	if (gf_dev->device_available != 1)
+		return;
+	gf_dev->fb_black = on ? 0 : 1;
+	sendnlmsg(&msg);
+#endif
+}
+EXPORT_SYMBOL_GPL(gf_notify_screen_state);
 
 static const struct file_operations gf_fops = {
 	.owner = THIS_MODULE,
