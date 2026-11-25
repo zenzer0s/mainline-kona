@@ -51,6 +51,42 @@ int sendnlmsg(char *msg)
 	return ret;
 }
 
+int sendnlmsg_tp(uint8_t cmd, const struct fp_underscreen_info *tp_info)
+{
+	struct sk_buff *skb;
+	struct nlmsghdr *nlh;
+	struct netlink_msg_info nl_msg = { 0 };
+	int len = NLMSG_SPACE(MAX_MSGSIZE);
+	int ret = 0;
+
+	if (!nl_sk || pid <= 0)
+		return -ENODEV;
+
+	skb = alloc_skb(len, GFP_ATOMIC);
+	if (!skb)
+		return -ENOMEM;
+
+	nlh = nlmsg_put(skb, 0, 0, 0, MAX_MSGSIZE, 0);
+	if (!nlh) {
+		kfree_skb(skb);
+		return -EMSGSIZE;
+	}
+
+	NETLINK_CB(skb).portid = 0;
+	NETLINK_CB(skb).dst_group = 0;
+
+	nl_msg.netlink_cmd = cmd;
+	if (tp_info)
+		nl_msg.tp_info = *tp_info;
+	memcpy(NLMSG_DATA(nlh), &nl_msg, sizeof(nl_msg));
+
+	ret = netlink_unicast(nl_sk, skb, pid, MSG_DONTWAIT);
+	if (ret > 0)
+		ret = 0;
+
+	return ret;
+}
+
 static void nl_data_ready(struct sk_buff *__skb)
 {
 	struct sk_buff *skb;

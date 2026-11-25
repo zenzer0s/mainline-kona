@@ -518,6 +518,43 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		pr_info("operation: 0x%x\n", info.operation);
 		break;
 
+	case GF_IOC_POWER_RESET:
+		pr_debug("%s GF_IOC_POWER_RESET\n", __func__);
+		gf_power_off(gf_dev);
+		msleep(10);
+		gf_power_on(gf_dev);
+		gf_hw_reset(gf_dev, 3);
+		gf_dev->device_available = 1;
+		break;
+
+	case GF_IOC_WAKELOCK_TIMEOUT_ENABLE:
+	case GF_IOC_WAKELOCK_TIMEOUT_DISABLE:
+	case GF_IOC_CLEAN_TOUCH_FLAG:
+	case GF_IOC_STOP_WAIT_INTERRUPT_EVENT:
+		break;
+
+	case GF_IOC_AUTO_SEND_TOUCHDOWN: {
+		struct fp_underscreen_info tp_info = {
+			.touch_state = 1,
+			.area_rate = 100,
+			.x = 540,
+			.y = 1897,
+		};
+		sendnlmsg_tp(GF_NET_EVENT_TP_TOUCHDOWN, &tp_info);
+		break;
+	}
+
+	case GF_IOC_AUTO_SEND_TOUCHUP: {
+		struct fp_underscreen_info tp_info = {
+			.touch_state = 0,
+			.area_rate = 0,
+			.x = 540,
+			.y = 1897,
+		};
+		sendnlmsg_tp(GF_NET_EVENT_TP_TOUCHUP, &tp_info);
+		break;
+	}
+
 	default:
 		pr_warn("unsupport cmd:0x%x\n", cmd);
 		break;

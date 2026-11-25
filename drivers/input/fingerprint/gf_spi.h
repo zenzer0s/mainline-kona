@@ -93,12 +93,19 @@ struct gf_ioc_chip_info {
 #define GF_IOC_GET_FW_INFO      _IOR(GF_IOC_MAGIC, 11, uint8_t)
 #define GF_IOC_REMOVE           _IO(GF_IOC_MAGIC, 12)
 #define GF_IOC_CHIP_INFO        _IOW(GF_IOC_MAGIC, 13, struct gf_ioc_chip_info)
+#define GF_IOC_POWER_RESET      _IO(GF_IOC_MAGIC, 17)
+#define GF_IOC_WAKELOCK_TIMEOUT_ENABLE  _IO(GF_IOC_MAGIC, 18)
+#define GF_IOC_WAKELOCK_TIMEOUT_DISABLE _IO(GF_IOC_MAGIC, 19)
+#define GF_IOC_CLEAN_TOUCH_FLAG         _IO(GF_IOC_MAGIC, 20)
+#define GF_IOC_AUTO_SEND_TOUCHDOWN      _IO(GF_IOC_MAGIC, 21)
+#define GF_IOC_AUTO_SEND_TOUCHUP        _IO(GF_IOC_MAGIC, 22)
+#define GF_IOC_STOP_WAIT_INTERRUPT_EVENT _IO(GF_IOC_MAGIC, 23)
 
 #if defined(SUPPORT_NAV_EVENT)
 #define GF_IOC_NAV_EVENT	_IOW(GF_IOC_MAGIC, 14, gf_nav_event_t)
-#define  GF_IOC_MAXNR    15  /* THIS MACRO IS NOT USED NOW... */
+#define  GF_IOC_MAXNR    24  /* THIS MACRO IS NOT USED NOW... */
 #else
-#define  GF_IOC_MAXNR    14  /* THIS MACRO IS NOT USED NOW... */
+#define  GF_IOC_MAXNR    24  /* THIS MACRO IS NOT USED NOW... */
 #endif
 
 //#define AP_CONTROL_CLK       1
@@ -109,7 +116,23 @@ struct gf_ioc_chip_info {
 #define GF_NET_EVENT_IRQ 1
 #define GF_NET_EVENT_FB_BLACK 2
 #define GF_NET_EVENT_FB_UNBLACK 3
+#define GF_NET_EVENT_TP_TOUCHDOWN 4
+#define GF_NET_EVENT_TP_TOUCHUP 5
+#define GF_NET_EVENT_UI_READY 6
+#define GF_NET_EVENT_UI_DISAPPEAR 7
 #define NETLINK_TEST 25
+
+struct fp_underscreen_info {
+	uint8_t touch_state;
+	uint8_t area_rate;
+	uint16_t x;
+	uint16_t y;
+};
+
+struct netlink_msg_info {
+	uint8_t netlink_cmd;
+	struct fp_underscreen_info tp_info;
+};
 
 struct gf_dev {
 	dev_t devt;
@@ -127,6 +150,8 @@ struct gf_dev {
 	unsigned int users;
 	unsigned int irq_gpio;
 	unsigned int reset_gpio;
+	int id_gpio;
+	int fp_id;
 	unsigned int vdd_max_uv;
 	unsigned int vdd_min_uv;
 	struct regulator *vdd;
@@ -152,6 +177,7 @@ int gf_hw_reset(struct gf_dev *gf_dev, unsigned int delay_ms);
 int gf_irq_num(struct gf_dev *gf_dev);
 
 int sendnlmsg(char *msg);
+int sendnlmsg_tp(uint8_t cmd, const struct fp_underscreen_info *tp_info);
 int netlink_init(void);
 void netlink_exit(void);
 #endif /*__GF_SPI_H*/

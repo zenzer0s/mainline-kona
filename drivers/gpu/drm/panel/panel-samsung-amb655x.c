@@ -6,9 +6,12 @@
 #include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/kobject.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/regulator/consumer.h>
+#include <linux/sysfs.h>
 
 #include <video/mipi_display.h>
 
@@ -27,7 +30,14 @@ struct amb655x {
 	struct drm_dsc_config dsc;
 	struct regulator_bulk_data *supplies;
 	struct gpio_desc *reset_gpio;
+	struct mutex lock;
+	bool prepared;
+	bool hbm;
+	u16 saved_brightness;
+	struct kobject *oplus_kobj;
 };
+
+static struct amb655x *g_amb655x_ctx;
 
 static const struct regulator_bulk_data amb655x_supplies[] = {
 	{ .supply = "vdd" },
@@ -248,6 +258,11 @@ static int amb655x_prepare(struct drm_panel *panel)
 		return ret;
 	}
 
+	mutex_lock(&ctx->lock);
+	ctx->prepared = true;
+	ctx->hbm = false;
+	mutex_unlock(&ctx->lock);
+
 	return 0;
 }
 
@@ -256,6 +271,11 @@ static int amb655x_unprepare(struct drm_panel *panel)
 	struct amb655x *ctx = to_amb655x(panel);
 	struct device *dev = &ctx->dsi->dev;
 	int ret;
+
+	mutex_lock(&ctx->lock);
+	ctx->prepared = false;
+	ctx->hbm = false;
+	mutex_unlock(&ctx->lock);
 
 	ret = amb655x_off(ctx);
 	if (ret < 0)
@@ -326,21 +346,110 @@ static const struct drm_panel_funcs amb655x_panel_funcs = {
 	.get_modes = amb655x_get_modes,
 };
 
+static int amb655x_set_hbm(struct amb655x *ctx, bool enable)
+{
+	struct mipi_dsi_device *dsi = ctx->dsi;
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
+	int ret = 0;
+
+	mutex_lock(&ctx->lock);
+	if (!ctx->prepared || ctx->hbm == enable) {
+		ctx->hbm = ctx->prepared ? enable : false;
+		mutex_unlock(&ctx->lock);
+		return 0;
+	}
+
+	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	if (enable) {
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x44);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0xe0);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x51, 0x0c, 0xa8);
+	} else {
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x4c);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0x20);
+		if (!dsi_ctx.accum_err)
+			mipi_dsi_dcs_set_display_brightness_large(dsi, ctx->saved_brightness);
+	}
+	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+
+	ret = dsi_ctx.accum_err;
+	if (!ret)
+		ctx->hbm = enable;
+	mutex_unlock(&ctx->lock);
+
+	return ret;
+}
+
+static ssize_t hbm_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	struct amb655x *ctx = g_amb655x_ctx;
+
+	return sysfs_emit(buf, "%d\n", ctx && ctx->hbm ? 1 : 0);
+}
+
+static ssize_t hbm_store(struct kobject *kobj, struct kobj_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct amb655x *ctx = g_amb655x_ctx;
+	unsigned int val;
+	int ret;
+
+	if (!ctx)
+		return -ENODEV;
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+	ret = amb655x_set_hbm(ctx, val != 0);
+	return ret ? ret : count;
+}
+
+static ssize_t notify_fppress_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return hbm_show(kobj, attr, buf);
+}
+
+static ssize_t notify_fppress_store(struct kobject *kobj, struct kobj_attribute *attr,
+				    const char *buf, size_t count)
+{
+	return hbm_store(kobj, attr, buf, count);
+}
+
+static struct kobj_attribute amb655x_hbm_attr = __ATTR_RW(hbm);
+static struct kobj_attribute amb655x_fppress_attr = __ATTR_RW(notify_fppress);
+
+static struct attribute *amb655x_oplus_attrs[] = {
+	&amb655x_hbm_attr.attr,
+	&amb655x_fppress_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group amb655x_oplus_attr_group = {
+	.attrs = amb655x_oplus_attrs,
+};
+
 static int amb655x_bl_update_status(struct backlight_device *bl)
 {
 	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	struct amb655x *ctx = mipi_dsi_get_drvdata(dsi);
 	u16 brightness = backlight_get_brightness(bl);
-	int ret;
+	int ret = 0;
 
-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	mutex_lock(&ctx->lock);
+	ctx->saved_brightness = brightness;
+	if (!ctx->hbm) {
+		dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+		ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+		dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	}
+	mutex_unlock(&ctx->lock);
 
-	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
-	if (ret < 0)
-		return ret;
-
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
-
-	return 0;
+	return ret < 0 ? ret : 0;
 }
 
 static int amb655x_bl_get_brightness(struct backlight_device *bl)
@@ -404,7 +513,16 @@ static int amb655x_probe(struct mipi_dsi_device *dsi)
 				     "Failed to get reset-gpios\n");
 
 	ctx->dsi = dsi;
+	mutex_init(&ctx->lock);
+	ctx->saved_brightness = 360;
 	mipi_dsi_set_drvdata(dsi, ctx);
+	g_amb655x_ctx = ctx;
+
+	ctx->oplus_kobj = kobject_create_and_add("oplus_display", kernel_kobj);
+	if (ctx->oplus_kobj) {
+		if (sysfs_create_group(ctx->oplus_kobj, &amb655x_oplus_attr_group))
+			dev_warn(dev, "Failed to create oplus_display sysfs group\n");
+	}
 
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;
@@ -453,6 +571,14 @@ static void amb655x_remove(struct mipi_dsi_device *dsi)
 {
 	struct amb655x *ctx = mipi_dsi_get_drvdata(dsi);
 	int ret;
+
+	if (ctx->oplus_kobj) {
+		sysfs_remove_group(ctx->oplus_kobj, &amb655x_oplus_attr_group);
+		kobject_put(ctx->oplus_kobj);
+		ctx->oplus_kobj = NULL;
+	}
+	if (g_amb655x_ctx == ctx)
+		g_amb655x_ctx = NULL;
 
 	ret = mipi_dsi_detach(dsi);
 	if (ret < 0)

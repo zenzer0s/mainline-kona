@@ -8,6 +8,18 @@
 / {
 	model = "OnePlus 8T";
 	compatible = "oneplus,kebab", "qcom,sm8250", "qcom,kona";
+
+	reserved-memory {
+		/*
+		 * Default CMA area for QTEE trusted app images and shared buffers.
+		 */
+		linux,cma {
+			compatible = "shared-dma-pool";
+			size = <0x0 0x10000000>;
+			reusable;
+			linux,cma-default;
+		};
+	};
 };
 
 &adsp {
@@ -171,6 +183,18 @@
 };
 
 &soc {
+	fingerprint {
+		compatible = "goodix,fingerprint";
+		fp-gpio-irq = <&tlmm 23 GPIO_ACTIVE_HIGH>;
+		fp-gpio-reset = <&tlmm 68 GPIO_ACTIVE_HIGH>;
+		fp-gpio-id = <&tlmm 77 GPIO_ACTIVE_HIGH>;
+		vdd-supply = <&vreg_l16a_2p7>;
+		vdd-min-uv = <3304000>;
+		vdd-max-uv = <3304000>;
+		pinctrl-0 = <&fp_irq_default>, <&fp_reset_default>, <&fp_id_default>;
+		pinctrl-names = "default";
+	};
+
 	oplus_sensor {
 		compatible = "oplus,sensor-devinfo";
 		als-row-coe = <466>;
@@ -315,6 +339,27 @@
 		output-high;
 		drive-strength = <2>;
 	};
+
+	fp_irq_default: fp-irq-default-state {
+		pins = "gpio23";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	fp_reset_default: fp-reset-default-state {
+		pins = "gpio68";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	fp_id_default: fp-id-default-state {
+		pins = "gpio77";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
 };
 
 &sound {
@@ -382,6 +427,11 @@
 
 &vreg_f {
 	status = "disabled";
+};
+
+/* Optical fingerprint sensor supply (stock drives pm8150_l16 at 3.3V) */
+&vreg_l16a_2p7 {
+	regulator-max-microvolt = <3304000>;
 };
 
 &wcd938x {

@@ -99,6 +99,19 @@ int gf_parse_dts(struct gf_dev *gf_dev)
 		goto err_reg;
 	}
 
+	gf_dev->fp_id = -1;
+	gf_dev->id_gpio = gf_of_get_gpio(np, "fp-gpio-id");
+	if (gf_dev->id_gpio >= 0) {
+		if (!gpio_request(gf_dev->id_gpio, "goodix_fp_id")) {
+			gpio_direction_input(gf_dev->id_gpio);
+			gf_dev->fp_id = gpio_get_value(gf_dev->id_gpio);
+			pr_info("goodix_fp: fp_id gpio=%d value=%d\n",
+				gf_dev->id_gpio, gf_dev->fp_id);
+		} else {
+			gf_dev->id_gpio = -EINVAL;
+		}
+	}
+
 	return rc;
 
 err_reg:
@@ -126,6 +139,10 @@ void gf_cleanup(struct gf_dev *gf_dev)
 		pr_info("remove reset_gpio success\n");
 	}
 	gf_dev->reset_gpio = -EINVAL;
+	if (gpio_is_valid(gf_dev->id_gpio)) {
+		gpio_free(gf_dev->id_gpio);
+		gf_dev->id_gpio = -EINVAL;
+	}
 }
 
 int gf_power_on(struct gf_dev *gf_dev)
