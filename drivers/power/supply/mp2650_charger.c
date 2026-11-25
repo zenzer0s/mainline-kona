@@ -283,10 +283,9 @@ struct mp2650_tcpm_state {
 	int imax_ua;
 };
 
-static int mp2650_match_tcpm_psy(struct device *dev, void *data)
+static int mp2650_match_tcpm_psy(struct power_supply *psy, void *data)
 {
 	struct mp2650_tcpm_state *st = data;
-	struct power_supply *psy = dev_get_drvdata(dev);
 	union power_supply_propval val;
 
 	if (!psy || !psy->desc || !psy->desc->name)
@@ -312,7 +311,7 @@ static void mp2650_supply_work(struct work_struct *work)
 	u32 vindpm_uv, iin_ua, ichg_ua;
 	u64 power_mw;
 
-	power_supply_for_each_device(&st, mp2650_match_tcpm_psy);
+	power_supply_for_each_psy(&st, mp2650_match_tcpm_psy);
 	if (!st.found || !st.online) {
 		if (chg->psy)
 			power_supply_changed(chg->psy);
