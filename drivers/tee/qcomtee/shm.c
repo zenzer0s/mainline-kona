@@ -173,6 +173,61 @@ err_release:
 	return rc;
 }
 
+/*
+ * Legacy QSEECom TAs (e.g. Goodix FP) pass 32-bit embedded physical addresses
+ * (is64 = 0) via IQSEEComCompat::sendRequest, which requires QTEE memory
+ * objects to reside below 4 GiB. Allocate from ZONE_DMA32 first (falling back
+ * to GFP_KERNEL only if ZONE_DMA32 is exhausted).
+ */
+static int qcomtee_shm_alloc_dma32(struct tee_shm *shm, size_t size)
+{
+	size_t nr_pages = DIV_ROUND_UP(size, PAGE_SIZE);
+	struct page **pages;
+	unsigned int i;
+	int rc;
+
+	if (!nr_pages)
+		return -EINVAL;
+
+	shm->kaddr = alloc_pages_exact(nr_pages * PAGE_SIZE,
+				       GFP_KERNEL | __GFP_ZERO | GFP_DMA32);
+	if (!shm->kaddr)
+		shm->kaddr = alloc_pages_exact(nr_pages * PAGE_SIZE,
+					       GFP_KERNEL | __GFP_ZERO);
+	if (!shm->kaddr)
+		return -ENOMEM;
+
+	shm->paddr = virt_to_phys(shm->kaddr);
+	shm->size = nr_pages * PAGE_SIZE;
+
+	pages = kcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages) {
+		rc = -ENOMEM;
+		goto err_pages;
+	}
+
+	for (i = 0; i < nr_pages; i++)
+		pages[i] = virt_to_page((u8 *)shm->kaddr + i * PAGE_SIZE);
+
+	shm->pages = pages;
+	shm->num_pages = nr_pages;
+
+	rc = qcomtee_shm_register(shm->ctx, shm, pages, nr_pages,
+				  (unsigned long)shm->kaddr);
+	if (rc)
+		goto err_kfree;
+
+	return 0;
+
+err_kfree:
+	kfree(pages);
+	shm->pages = NULL;
+err_pages:
+	free_pages_exact(shm->kaddr, shm->size);
+	shm->kaddr = NULL;
+	return rc;
+}
+
 static int pool_op_alloc(struct tee_shm_pool *pool, struct tee_shm *shm,
 			 size_t size, size_t align)
 {
@@ -185,7 +240,7 @@ static int pool_op_alloc(struct tee_shm_pool *pool, struct tee_shm *shm,
 			return rc;
 	}
 
-	return tee_dyn_shm_alloc_helper(shm, size, align, qcomtee_shm_register);
+	return qcomtee_shm_alloc_dma32(shm, size);
 }
 
 static void pool_op_free(struct tee_shm_pool *pool, struct tee_shm *shm)
