@@ -314,6 +314,14 @@ config QCOM_KLOG_FLUSH
 	  that takes DRAM with it (a PON shutdown after a long power-button
 	  press, a cold reset).
 
+config QCOM_OPLUS_SENSOR_DEVINFO
+	bool "OPlus/OnePlus SLPI sensor devinfo SMEM publisher"
+	depends on OF && QCOM_SMEM
+	help
+	  Populates Qualcomm SMEM item 130 (SMEM_SENSOR) from the device tree
+	  "oplus,sensor-devinfo" node so OPlus/OnePlus SLPI firmware can
+	  discover and probe board sensors (BMI260, AKM0991X, STK33502, etc.).
+
 endmenu
 
 config QCOM_UBWC_CONFIG

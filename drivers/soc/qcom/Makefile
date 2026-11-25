@@ -42,3 +42,4 @@ obj-$(CONFIG_QCOM_PBS) +=	qcom-pbs.o
 obj-$(CONFIG_QCOM_UBWC_CONFIG) += ubwc_config.o
 obj-$(CONFIG_QCOM_UEFI_KBOOTLOG) += uefi_kbootlog.o
 obj-$(CONFIG_QCOM_KLOG_FLUSH) += klog_flush.o
+obj-$(CONFIG_QCOM_OPLUS_SENSOR_DEVINFO) += oplus_sensor_devinfo.o

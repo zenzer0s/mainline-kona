@@ -170,6 +170,125 @@
 	status = "okay";
 };
 
+&soc {
+	oplus_sensor {
+		compatible = "oplus,sensor-devinfo";
+		als-row-coe = <466>;
+
+		gsensor-0 {
+			sensor-name = <0x8>; /* BMI260 */
+			sensor-direction = <4>;
+			sensor-index = <0>;
+			sensor-type = <0>; /* OPLUS_ACCEL */
+		};
+
+		msensor-0 {
+			sensor-name = <0x1>; /* AKM0991X */
+			sensor-direction = <4>;
+			sensor-index = <0>;
+			sensor-type = <2>; /* OPLUS_MAG */
+			parameter-number = <18>;
+			soft-mag-parameter = <10000 0 0 0 0 0 0 0 10000 0 0 0 0 0 0 0 10000 0>;
+		};
+
+		msensor-1 {
+			sensor-name = <0x2>; /* MMC5603 */
+			sensor-direction = <1>;
+			sensor-index = <1>;
+			sensor-type = <2>; /* OPLUS_MAG */
+			parameter-number = <18>;
+			soft-mag-parameter = <9941 0 1024 0 356 0 137 0 9375 0 608 0 102 0 495 0 11471 0>;
+		};
+
+		lsensor-0 {
+			sensor-name = <0x01>; /* STK33502 */
+			sensor-index = <0>;
+			sensor-type = <3>; /* OPLUS_LIGHT */
+			bus-number = <5>;
+			irq-number = <136>;
+			als-type = <2>;
+			is-unit-device = <1>;
+			is-als-dri = <0>;
+			als-factor = <466>;
+			is_als_initialed = <0>;
+			als_buffer_length = <10>;
+		};
+
+		psensor-0 {
+			sensor-name = <0x1>; /* STK33502 */
+			sensor-index = <0>;
+			sensor-type = <4>; /* OPLUS_PROXIMITY */
+			bus-number = <5>;
+			irq-number = <136>;
+			ps-type = <1>;
+			ps_saturation = <2600>;
+			is_need_close_pd = <0>;
+			parameter-number = <4>;
+			sensor-reg = <0x01 0x32 0x03 0x80 0xDB 0x00>;
+		};
+
+		ssensor-0 {
+			sensor-name = <0x1>; /* SX9324 */
+			sensor-index = <0>;
+			sensor-type = <5>; /* OPLUS_SAR */
+			parameter-number = <18>;
+			sensor-reg = <0x10 0x16 0x24 0x5F 0x26 0x00 0x27 0x5F
+				      0x28 0x37 0x29 0x1F 0x2A 0x3D 0x36 0x24
+				      0x37 0x24>;
+		};
+
+		sdsensor-0 {
+			sensor-name = <0x1>; /* SX9324 */
+			sensor-index = <0>;
+			sensor-type = <9>; /* OPLUS_SARS */
+			parameter-number = <18>;
+			sensor-reg = <0x23 0x00 0x24 0x5F 0x26 0x00 0x27 0x5F
+				      0x28 0x3D 0x29 0x1F 0x2A 0x37 0x36 0x32
+				      0x37 0x24>;
+		};
+
+		cctrsensor-0 {
+			decoupled-driver = <0>;
+			sensor-name = <0x1>; /* TCS3408 */
+			sensor-index = <0>;
+			sensor-type = <7>; /* OPLUS_CCT_REAR */
+			para-matrix = <4>;
+		};
+
+		bsensor-1 {
+			sensor-name = <0x2>; /* BMP380 */
+			sensor-index = <0>;
+			sensor-type = <8>; /* OPLUS_BAROMETER */
+		};
+
+		pickup_detect {
+			sensor-type = <0>;
+			is-virtual-sensor;
+			is-need-prox = <1>;
+			prox-type = <0>;
+		};
+
+		lux_aod {
+			sensor-type = <1>;
+			is-virtual-sensor;
+			thrd-low = <12>;
+			thrd-high = <50>;
+			als-type = <1>;
+		};
+
+		fp_display {
+			sensor-type = <3>;
+			is-virtual-sensor;
+			prox-type = <0>;
+		};
+
+		free_fall {
+			sensor-type = <4>;
+			is-virtual-sensor;
+		};
+	};
+};
+
 &tlmm {
 	/*
 	 * External SDX55 handshake (downstream esoc mdm0): tell the modem the
