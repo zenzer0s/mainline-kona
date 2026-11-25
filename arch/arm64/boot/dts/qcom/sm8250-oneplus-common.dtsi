@@ -65,14 +65,18 @@
 			compatible = "simple-framebuffer";
 			memory-region = <&framebuffer_mem>;
 			format = "a8r8g8b8";
+			/*
+			 * No BYTE0/BYTE0_INTF/PCLK0 here: their parent is the DSI PHY
+			 * PLL, which only registers later. Enabling them while still
+			 * orphaned made the reparent at PHY probe disable a parent that
+			 * was never enabled (clk.c WARN x2, taint). The bootloader's
+			 * PLL keeps running (clk_ignore_unused) until msm takes over.
+			 */
 			clocks = <&dispcc DISP_CC_MDSS_AHB_CLK>,
 				 <&gcc GCC_DISP_HF_AXI_CLK>,
 				 <&gcc GCC_DISP_SF_AXI_CLK>,
 				 <&dispcc DISP_CC_MDSS_VSYNC_CLK>,
 				 <&dispcc DISP_CC_MDSS_MDP_CLK>,
-				 <&dispcc DISP_CC_MDSS_BYTE0_CLK>,
-				 <&dispcc DISP_CC_MDSS_BYTE0_INTF_CLK>,
-				 <&dispcc DISP_CC_MDSS_PCLK0_CLK>,
 				 <&dispcc DISP_CC_MDSS_ESC0_CLK>;
 			power-domains = <&dispcc MDSS_GDSC>;
 		};
@@ -654,6 +658,8 @@
 };
 
 &i2c1 {
+	clock-frequency = <400000>;
+
 	status = "okay";
 
 	nfc@28 {
@@ -666,6 +672,8 @@
 };
 
 &i2c11 {
+	clock-frequency = <400000>;
+
 	status = "okay";
 
 	haptics@5a {
@@ -692,6 +700,8 @@
 };
 
 &i2c15 {
+	clock-frequency = <400000>;
+
 	status = "okay";
 
 	fsa4480: typec-mux@42 {
@@ -1143,22 +1153,11 @@
 		};
 	};
 
-	displayport-dai-link {
-		link-name = "DisplayPort Playback";
-
-		codec {
-			sound-dai = <&mdss_dp>;
-		};
-
-		cpu {
-			sound-dai = <&q6afedai DISPLAY_PORT_RX>;
-		};
-
-		platform {
-			sound-dai = <&q6routing>;
-		};
-	};
-
+	/*
+	 * No DisplayPort audio link: AFE port 0x6020 (DISPLAY_PORT_RX) fails to
+	 * start with DSP error 9 / -110 whenever it gets prepared, and USB-C DP
+	 * audio is not used on these phones.
+	 */
 	speaker-dai-link {
 		link-name = "Speaker Playback";
 

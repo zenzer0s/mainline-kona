@@ -144,6 +144,9 @@
 };
 
 &i2c16 {
+	/* OOS runs this bus at 100 kHz; 400 kHz NAKs the gauge at 0x55 */
+	clock-frequency = <100000>;
+
 	status = "okay";
 
 	fuel-gauge@55 {
