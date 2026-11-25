@@ -720,6 +720,27 @@ static int ramoops_parse_dt(struct platform_device *pdev,
 	return 0;
 }
 
+/* Summarise what the previous boot left behind, one line for dmesg. */
+static void ramoops_report_previous(struct ramoops_context *cxt)
+{
+	size_t cons = 0, pmsg = 0, ftrace = 0;
+	unsigned int dumps = 0, i;
+
+	for (i = 0; i < cxt->max_dump_cnt; i++)
+		if (cxt->dprzs[i] && persistent_ram_old_size(cxt->dprzs[i]))
+			dumps++;
+	if (cxt->cprz)
+		cons = persistent_ram_old_size(cxt->cprz);
+	if (cxt->mprz)
+		pmsg = persistent_ram_old_size(cxt->mprz);
+	for (i = 0; i < cxt->max_ftrace_cnt; i++)
+		if (cxt->fprzs && cxt->fprzs[i])
+			ftrace += persistent_ram_old_size(cxt->fprzs[i]);
+
+	pr_info("previous boot left: %u dump record(s), console %zu, pmsg %zu, ftrace %zu bytes\n",
+		dumps, cons, pmsg, ftrace);
+}
+
 static int ramoops_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -868,6 +889,8 @@ static int ramoops_probe(struct platform_device *pdev)
 	pr_info("using 0x%lx@0x%llx, ecc: %d\n",
 		cxt->size, (unsigned long long)cxt->phys_addr,
 		cxt->ecc_info.ecc_size);
+
+	ramoops_report_previous(cxt);
 
 	return 0;
 

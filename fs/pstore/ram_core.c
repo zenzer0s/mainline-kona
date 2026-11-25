@@ -541,23 +541,31 @@ static int persistent_ram_post_init(struct persistent_ram_zone *prz, u32 sig,
 
 	if (prz->buffer->sig == sig) {
 		if (buffer_size(prz) == 0 && buffer_start(prz) == 0) {
-			pr_debug("found existing empty buffer\n");
+			pr_info("%pa: valid header, buffer empty\n", &prz->paddr);
 			return 0;
 		}
 
 		if (buffer_size(prz) > prz->buffer_size ||
 		    buffer_start(prz) > buffer_size(prz)) {
-			pr_info("found existing invalid buffer, size %zu, start %zu\n",
-				buffer_size(prz), buffer_start(prz));
+			pr_info("%pa: found existing invalid buffer, size %zu, start %zu\n",
+				&prz->paddr, buffer_size(prz), buffer_start(prz));
 			zap = true;
 		} else {
-			pr_debug("found existing buffer, size %zu, start %zu\n",
-				 buffer_size(prz), buffer_start(prz));
+			pr_info("%pa: restored previous data, size %zu, start %zu\n",
+				&prz->paddr, buffer_size(prz), buffer_start(prz));
 			persistent_ram_save_old(prz);
+			return 0;
 		}
+	} else if (!prz->buffer->sig && !buffer_size(prz) &&
+		   !buffer_start(prz)) {
+		pr_info("%pa: no previous data, header is zeroed (wiped or first boot)\n",
+			&prz->paddr);
+		/* Without the signature this boot's records would be treated as a
+		 * foreign header and dropped on the next boot. */
+		prz->buffer->sig = sig;
 	} else {
-		pr_debug("no valid data in buffer (sig = 0x%08x)\n",
-			 prz->buffer->sig);
+		pr_info("%pa: no previous data, foreign header (sig 0x%08x, expected 0x%08x)\n",
+			&prz->paddr, prz->buffer->sig, sig);
 		prz->buffer->sig = sig;
 		zap = true;
 	}
