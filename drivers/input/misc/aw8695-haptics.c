@@ -519,7 +519,7 @@
 #define RICHTAP_MMAP_BUF_SIZE			1000
 #define RICHTAP_MMAP_PAGE_ORDER			2
 #define RICHTAP_MMAP_BUF_SUM			16
-#define RICHTAP_RTP_MAX_CHUNK			256
+#define RICHTAP_RTP_MAX_CHUNK			512
 
 #pragma pack(4)
 struct mmap_buf_format {
@@ -549,6 +549,7 @@ struct aw8695_data {
 	struct regmap *regmap;
 	struct gpio_desc *reset_gpio;
 	struct mutex lock;
+	u8 chipid;
 	bool running;
 	struct work_struct play_work;
 	/* Parameters from devicetree */
@@ -751,7 +752,7 @@ static int aw8695_haptics_stop(struct aw8695_data *haptics)
 		return err;
 
 	err = regmap_read_poll_timeout(haptics->regmap, AW8695_GLB_STATE, read_buf,
-			(read_buf & 0x0f) == 0, 2000, 2000 * 100);
+			(read_buf & 0x0f) == 0, 500, 2000 * 100);
 	if (err) {
 		dev_err(dev, "Did not enter standby: %d\n", err);
 		// FIXME
@@ -1002,6 +1003,10 @@ static int aw8695_haptic_get_f0(struct aw8695_data *haptics)
 	f0 = aw8695_haptic_read_f0(haptics);
 
 	/* restore default config */
+	err = regmap_update_bits(haptics->regmap, AW8695_DATCTRL,
+		AW8695_DATCTRL_LPF_ENABLE_MASK, AW8695_DATCTRL_LPF_DISABLE);
+	if (err)
+		return err;
 	err = regmap_update_bits(haptics->regmap, AW8695_CONT_CTRL,
 		AW8695_CONT_CTRL_EN_CLOSE_MASK, AW8695_CONT_CTRL_CLOSE_PLAYBACK);
 	if (err)
@@ -1102,6 +1107,7 @@ static int aw8695_init(struct aw8695_data *haptics)
 	case AW8624_CHIPID:
 	case AW8695_CHIPID:
 	case AW8697_CHIPID:
+		haptics->chipid = (u8)read_buf;
 		break;
 	default:
 		dev_err(dev, "Chip ID mismatch: expected %x|%x|%x, got %x\n",
@@ -1186,9 +1192,11 @@ static int aw8695_init(struct aw8695_data *haptics)
 	if (err)
 		return err;
 
-	/* Set boost peak current */
+	/* Set boost peak current (stock AW8697 uses 3.5A for sharp transient punch) */
 	err = regmap_update_bits(haptics->regmap, AW8695_BSTCFG,
-		AW8695_BSTCFG_PEAKCUR_MASK, AW8695_BSTCFG_PEAKCUR_2A);
+		AW8695_BSTCFG_PEAKCUR_MASK,
+		haptics->chipid == AW8697_CHIPID ?
+			AW8695_BSTCFG_PEAKCUR_3P5A : AW8695_BSTCFG_PEAKCUR_2A);
 	if (err)
 		return err;
 
@@ -1321,6 +1329,9 @@ static irqreturn_t aw8695_irq(int irq, void *data)
 	unsigned int read_buf;
 	int err;
 
+	if (haptics->haptic_rtp_mode)
+		return IRQ_HANDLED;
+
 	err = regmap_read(haptics->regmap, AW8695_SYSINT, &read_buf);
 	if (err) {
 		dev_err(dev, "Failed to read SYSINT register: %d\n", err);
@@ -1383,6 +1394,25 @@ static int aw8695_haptic_set_rtp_aei(struct aw8695_data *haptics, bool enable)
 				  enable ? 0 : AW8695_SYSINTM_FF_AE_OFF);
 }
 
+static int aw8695_richtap_set_osc_clock(struct aw8695_data *haptics, bool rtp_osc)
+{
+	/*
+	 * aw8695_haptic_get_f0() switches ANACTRL.LRA_SRC to REG for f0-calibrated
+	 * RAM playback. For 24 kHz RichTap RTP waveforms (already f0-resampled by
+	 * libaacvibrator.so), restore the factory eFuse 24 MHz oscillator trim so
+	 * waveforms stay dead-on the LRA's high-Q resonant frequency.
+	 */
+	if (rtp_osc) {
+		return regmap_update_bits(haptics->regmap, AW8695_ANACTRL,
+					  AW8695_ANACTRL_LRA_SRC_MASK,
+					  AW8695_ANACTRL_LRA_SRC_EFUSE);
+	}
+	regmap_update_bits(haptics->regmap, AW8695_ANACTRL,
+			   AW8695_ANACTRL_LRA_SRC_MASK,
+			   AW8695_ANACTRL_LRA_SRC_REG);
+	return regmap_write(haptics->regmap, AW8695_TRIM_LRA, haptics->f0_cali_lra);
+}
+
 static int aw8695_rtp_write(struct aw8695_data *haptics, const u8 *buf, size_t len)
 {
 	size_t off = 0;
@@ -1397,6 +1427,47 @@ static int aw8695_rtp_write(struct aw8695_data *haptics, const u8 *buf, size_t l
 		if (ret < 0)
 			return ret;
 		off += chunk;
+	}
+	return 0;
+}
+
+static int aw8695_rtp_write_fifo(struct aw8695_data *haptics, const u8 *buf, size_t len)
+{
+	size_t off = 0;
+	ktime_t t_start;
+
+	/* Payloads <= 2 KB fit directly in the AW8697 hardware RTP FIFO */
+	if (len <= AW8695_RAM_BASE_ADDR)
+		return aw8695_rtp_write(haptics, buf, len);
+
+	/* Larger payloads: prefill 1.5 KB then pace on FIFO almost-full status */
+	off = min_t(size_t, len, AW8695_RAM_BASE_ADDR - (AW8695_RAM_BASE_ADDR >> 2));
+	if (aw8695_rtp_write(haptics, buf, off) < 0)
+		return -EIO;
+
+	t_start = ktime_get();
+	while (off < len) {
+		unsigned int sysst = 0;
+		size_t chunk;
+		int ret;
+
+		if (ktime_us_delta(ktime_get(), t_start) > 800000)
+			return -ETIMEDOUT;
+		ret = regmap_read(haptics->regmap, AW8695_SYSST, &sysst);
+		if (ret)
+			return ret;
+		if (sysst & AW8695_SYSST_DONES)
+			break;
+		if (sysst & AW8695_SYSST_FF_AFS) {
+			usleep_range(500, 800);
+			continue;
+		}
+		chunk = min_t(size_t, len - off, RICHTAP_RTP_MAX_CHUNK);
+		ret = aw8695_rtp_write(haptics, buf + off, chunk);
+		if (ret)
+			return ret;
+		off += chunk;
+		t_start = ktime_get();
 	}
 	return 0;
 }
@@ -1433,7 +1504,7 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 			if (!atomic_read(&haptics->done_flag)) {
 				/* Keep FF_AEI masked: this loop polls SYSST directly */
 				aw8695_haptic_set_rtp_aei(haptics, false);
-				regmap_write(haptics->regmap, AW8695_TRIM_LRA, 0x00);
+				aw8695_richtap_set_osc_clock(haptics, true);
 				aw8695_set_work_mode(haptics, AW8695_RTP_MODE);
 				aw8695_interrupt_clear(haptics);
 				regmap_update_bits(haptics->regmap, AW8695_GO,
@@ -1497,7 +1568,8 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 	aw8695_haptic_set_rtp_aei(haptics, false);
 	if (timed_out || atomic_read(&haptics->done_flag))
 		aw8695_haptics_stop(haptics);
-	regmap_write(haptics->regmap, AW8695_TRIM_LRA, haptics->f0_cali_lra);
+	if (haptics->input_dev)
+		aw8695_richtap_set_osc_clock(haptics, false);
 	haptics->haptic_rtp_mode = false;
 	mutex_unlock(&haptics->lock);
 }
@@ -1576,12 +1648,12 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 			return -EINVAL;
 		}
 		aw8695_haptic_set_bst_vol(haptics, 0x11);
-		regmap_write(haptics->regmap, AW8695_TRIM_LRA, 0x00);
+		aw8695_richtap_set_osc_clock(haptics, true);
 		aw8695_set_work_mode(haptics, AW8695_RTP_MODE);
 		regmap_update_bits(haptics->regmap, AW8695_GO,
 				   AW8695_GO_ENABLE, AW8695_GO_ENABLE);
 		usleep_range(2000, 2500);
-		ret = aw8695_rtp_write(haptics, &haptics->rtp_ptr[4], tmp);
+		ret = aw8695_rtp_write_fifo(haptics, &haptics->rtp_ptr[4], tmp);
 		mutex_unlock(&haptics->lock);
 		mutex_unlock(&haptics->ioctl_lock);
 		return ret;
@@ -1612,7 +1684,8 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 		mutex_lock(&haptics->lock);
 		aw8695_haptic_set_rtp_aei(haptics, false);
 		aw8695_haptics_stop(haptics);
-		regmap_write(haptics->regmap, AW8695_TRIM_LRA, haptics->f0_cali_lra);
+		if (haptics->input_dev)
+			aw8695_richtap_set_osc_clock(haptics, false);
 		haptics->haptic_rtp_mode = false;
 		mutex_unlock(&haptics->lock);
 		mutex_unlock(&haptics->ioctl_lock);

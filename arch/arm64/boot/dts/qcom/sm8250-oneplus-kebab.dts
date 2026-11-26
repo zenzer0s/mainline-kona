@@ -236,6 +236,17 @@
 	firmware-name = "qcom/sm8250/OnePlus/kebab/a650_zap.mbn";
 };
 
+&i2c11 {
+	/* OnePlus 8T routes AW8697 IRQ to TLMM GPIO 11 (8/8 Pro use GPIO 118). */
+	haptics@5a {
+		interrupts-extended = <&tlmm 11 IRQ_TYPE_EDGE_FALLING>;
+	};
+};
+
+&aw_irq_gpio_default {
+	pins = "gpio11";
+};
+
 &i2c2 {
 	pm8008: pmic@8 {
 		compatible = "qcom,pm8008";
