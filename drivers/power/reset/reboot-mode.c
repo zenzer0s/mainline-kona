@@ -26,7 +26,7 @@ static unsigned int get_reboot_mode_magic(struct reboot_mode_driver *reboot,
 	struct mode_info *info;
 	char cmd_[110];
 
-	if (!cmd)
+	if (!cmd || !cmd[0])
 		cmd = normal;
 
 	list_for_each_entry(info, &reboot->head, list)
@@ -34,16 +34,26 @@ static unsigned int get_reboot_mode_magic(struct reboot_mode_driver *reboot,
 			return info->magic;
 
 	/* try to match again, replacing characters impossible in DT */
-	if (strscpy(cmd_, cmd, sizeof(cmd_)) == -E2BIG)
-		return 0;
+	if (strscpy(cmd_, cmd, sizeof(cmd_)) != -E2BIG) {
+		strreplace(cmd_, ' ', '-');
+		strreplace(cmd_, ',', '-');
+		strreplace(cmd_, '/', '-');
 
-	strreplace(cmd_, ' ', '-');
-	strreplace(cmd_, ',', '-');
-	strreplace(cmd_, '/', '-');
+		list_for_each_entry(info, &reboot->head, list)
+			if (!strcmp(info->mode, cmd_))
+				return info->magic;
+	}
 
-	list_for_each_entry(info, &reboot->head, list)
-		if (!strcmp(info->mode, cmd_))
-			return info->magic;
+	/* Fall back to mode-normal for unrecognized reboot reasons (e.g.
+	 * Android's "from_fastboot" or "userrequested") so bootloaders that
+	 * require a non-zero normal reboot magic do not misclassify a
+	 * USB-connected reboot as offline charging.
+	 */
+	if (strcmp(cmd, normal)) {
+		list_for_each_entry(info, &reboot->head, list)
+			if (!strcmp(info->mode, normal))
+				return info->magic;
+	}
 
 	return 0;
 }
@@ -53,6 +63,9 @@ static int reboot_mode_notify(struct notifier_block *this,
 {
 	struct reboot_mode_driver *reboot;
 	unsigned int magic;
+
+	if (mode != SYS_RESTART)
+		return NOTIFY_DONE;
 
 	reboot = container_of(this, struct reboot_mode_driver, reboot_notifier);
 	magic = get_reboot_mode_magic(reboot, cmd);

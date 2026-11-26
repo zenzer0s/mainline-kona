@@ -965,8 +965,14 @@
 };
 
 &pon {
+	mode-normal = <0x3e>;
 	mode-bootloader = <0x2>;
 	mode-recovery = <0x1>;
+	mode-rtc = <0x3>;
+	mode-dm-verity-device-corrupted = <0x4>;
+	mode-dm-verity-enforcing = <0x5>;
+	mode-keys-clear = <0x6>;
+	mode-kernel = <0x27>;
 };
 
 &pon_pwrkey {
