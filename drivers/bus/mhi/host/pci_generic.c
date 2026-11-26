@@ -607,6 +607,7 @@ static const struct mhi_pci_dev_info mhi_oneplus_sdx55_info = {
 	.mru_default = 32768,
 	.sideband_wake = false,
 	.no_m3 = true,
+	.reset_on_remove = true,
 };
 
 static const struct mhi_pci_dev_info mhi_foxconn_t99w175_info = {
@@ -1095,6 +1096,8 @@ struct mhi_pci_device {
 	/* bring-up: periodic dump of a flashless modem's boot progress */
 	struct delayed_work boot_dbg_work;
 	unsigned int boot_dbg_left;
+	unsigned int sbl_stall_count;
+	unsigned int sbl_reset_retries;
 	/* flashless modem: power up only once its SBL is readable */
 	struct delayed_work fw_wait_work;
 	unsigned int fw_wait_left;
@@ -1182,7 +1185,9 @@ static void mhi_pci_fw_wait(struct work_struct *work)
 						       struct mhi_pci_device, fw_wait_work);
 	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
 	struct device *dev = mhi_cntrl->cntrl_dev;
+	struct pci_dev *pdev = to_pci_dev(dev);
 	const struct firmware *fw;
+	enum mhi_ee_type ee;
 
 	/* no sysfs fallback: that blocks for 60 s per try before /vendor is up */
 	if (request_firmware_direct(&fw, mhi_cntrl->fw_image, dev)) {
@@ -1202,8 +1207,31 @@ static void mhi_pci_fw_wait(struct work_struct *work)
 		return;
 	}
 
+	ee = mhi_get_exec_env(mhi_cntrl);
 	dev_info(dev, "%s readable, powering up (device ee %d)\n",
-		 mhi_cntrl->fw_image, mhi_get_exec_env(mhi_cntrl));
+		 mhi_cntrl->fw_image, ee);
+	/*
+	 * After an unclean/warm host reset, the flashless SDX55 may still be
+	 * left in SBL/AMSS/RDDM from the previous boot and ignore BHI/Sahara.
+	 * Force an SoC reset back to PBL before powering up MHI.
+	 */
+	if (ee != MHI_EE_PBL) {
+		unsigned long deadline = jiffies + msecs_to_jiffies(3000);
+
+		dev_warn(dev, "device in non-PBL ee %d before power-up, issuing SoC reset\n",
+			 ee);
+		mhi_soc_reset(mhi_cntrl);
+		msleep(MHI_POST_RESET_DELAY_MS);
+		pci_load_saved_state(pdev, mhi_pdev->pci_state);
+		pci_restore_state(pdev);
+		while (time_before(jiffies, deadline)) {
+			ee = mhi_get_exec_env(mhi_cntrl);
+			if (ee == MHI_EE_PBL)
+				break;
+			msleep(100);
+		}
+		dev_info(dev, "post-reset device ee %d\n", ee);
+	}
 	if (mhi_async_power_up(mhi_cntrl)) {
 		dev_err(dev, "failed to power up MHI controller\n");
 		return;
@@ -1218,6 +1246,7 @@ static void mhi_pci_boot_dbg(struct work_struct *work)
 						       struct mhi_pci_device, boot_dbg_work);
 	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
 	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
+	enum mhi_ee_type dev_ee;
 	u16 cmd = 0, sta = 0, mctl = 0;
 	u32 alo = 0, ahi = 0, data = 0;
 
@@ -1234,11 +1263,27 @@ static void mhi_pci_boot_dbg(struct work_struct *work)
 		pci_read_config_dword(pdev, pdev->msi_cap + PCI_MSI_DATA_64, &data);
 	}
 
+	dev_ee = mhi_get_exec_env(mhi_cntrl);
 	dev_info(&pdev->dev,
 		 "boot-dbg: mhi state %d ee %d (host ee %d) [ee 0=PBL 1=SBL 2=AMSS] cmd %#x sta %#x msi ctl %#x addr %#x:%08x data %#x irqs %d\n",
-		 mhi_get_mhi_state(mhi_cntrl), mhi_get_exec_env(mhi_cntrl),
+		 mhi_get_mhi_state(mhi_cntrl), dev_ee,
 		 mhi_cntrl->ee, cmd, sta, mctl, ahi, alo, data,
 		 mhi_cntrl->nr_irqs);
+
+	if (dev_ee == MHI_EE_AMSS && mhi_cntrl->ee == MHI_EE_AMSS) {
+		mhi_pdev->sbl_stall_count = 0;
+	} else if (mhi_pdev->poll_irqs) {
+		mhi_pdev->sbl_stall_count++;
+		if (mhi_pdev->sbl_stall_count >= 4 && mhi_pdev->sbl_reset_retries < 2) {
+			mhi_pdev->sbl_stall_count = 0;
+			mhi_pdev->sbl_reset_retries++;
+			dev_warn(&pdev->dev,
+				 "modem stalled in ee %d (host ee %d), triggering SoC reset recovery (%u/2)\n",
+				 dev_ee, mhi_cntrl->ee, mhi_pdev->sbl_reset_retries);
+			queue_work(system_long_wq, &mhi_pdev->recovery_work);
+			return;
+		}
+	}
 
 	if (--mhi_pdev->boot_dbg_left)
 		schedule_delayed_work(&mhi_pdev->boot_dbg_work, 5 * HZ);
@@ -1417,6 +1462,7 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 	dev_warn(&pdev->dev, "device recovery started\n");
 
 	cancel_delayed_work_sync(&mhi_pdev->poll_work);
+	cancel_delayed_work_sync(&mhi_pdev->boot_dbg_work);
 
 	if (!pdev->is_virtfn)
 		timer_delete(&mhi_pdev->health_check_timer);
@@ -1429,6 +1475,12 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 		mhi_unprepare_after_power_down(mhi_cntrl);
 	}
 
+	if (mhi_pdev->poll_irqs) {
+		/* Flashless SDX55: force SoC reset back to PBL before re-booting */
+		mhi_soc_reset(mhi_cntrl);
+		msleep(MHI_POST_RESET_DELAY_MS);
+	}
+
 	pci_set_power_state(pdev, PCI_D0);
 	pci_load_saved_state(pdev, mhi_pdev->pci_state);
 	pci_restore_state(pdev);
@@ -1439,6 +1491,21 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 	err = mhi_prepare_for_power_up(mhi_cntrl);
 	if (err)
 		goto err_try_reset;
+
+	if (mhi_pdev->poll_irqs) {
+		/*
+		 * Polling devices need poll_work active during BHI/SBL->AMSS
+		 * transitions, so use async power-up and start polling right away.
+		 */
+		err = mhi_async_power_up(mhi_cntrl);
+		if (err)
+			goto err_unprepare;
+
+		dev_info(&pdev->dev, "Async recovery started (device ee %d)\n",
+			 mhi_get_exec_env(mhi_cntrl));
+		mhi_pci_start(mhi_pdev);
+		return;
+	}
 
 	err = mhi_sync_power_up(mhi_cntrl);
 	if (err)
