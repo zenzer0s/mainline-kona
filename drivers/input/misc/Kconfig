@@ -1003,4 +1003,6 @@ config INPUT_STPMIC1_ONKEY
 	  To compile this driver as a module, choose M here: the
 	  module will be called stpmic1_onkey.
 
+source "drivers/input/misc/oplus_tri_state_key/Kconfig"
+
 endif

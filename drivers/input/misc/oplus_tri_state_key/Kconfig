@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config INPUT_OPLUS_TRI_STATE_KEY
+	tristate "OPlus dual-Hall Alert Slider (tri-state key) support"
+	depends on I2C && INPUT
+	help
+	  Say Y here to enable support for the 3-position magnetic Alert Slider
+	  used on OnePlus SM8250 devices (OnePlus 8 / 8 Pro / 8T) backed by
+	  dual iSentek IST8801 or MagnaChip MXM1120 Hall-effect sensors.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called oplus-tri-state-key.
