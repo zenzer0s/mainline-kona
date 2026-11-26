@@ -250,6 +250,50 @@
 	firmware-name = "qcom/sm8250/OnePlus/kebab/a650_zap.mbn";
 };
 
+&i2c1 {
+	/*
+	 * Dual-Hall Alert Slider sensors: OnePlus 8T ships with either
+	 * iSentek IST8801 (0x19/0x18) or MagnaChip MXM1120 (0x0d/0x0c).
+	 * Pinctrl uses the non-default "active" state so only the populated
+	 * pair claims the shared IRQ GPIOs after I2C DID verification.
+	 */
+	hall-up@19 {
+		compatible = "oplus,hall-ist8801,up";
+		reg = <0x19>;
+		vdd-supply = <&vreg_l10c_3p0>;
+		interrupts-extended = <&tlmm 157 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "active";
+		pinctrl-0 = <&hall_up_irq_active>;
+	};
+
+	hall-down@18 {
+		compatible = "oplus,hall-ist8801,down";
+		reg = <0x18>;
+		vdd-supply = <&vreg_l10c_3p0>;
+		interrupts-extended = <&tlmm 138 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "active";
+		pinctrl-0 = <&hall_down_irq_active>;
+	};
+
+	hall-up@d {
+		compatible = "oplus,hall-mxm1120,up";
+		reg = <0x0d>;
+		vdd-supply = <&vreg_l10c_3p0>;
+		interrupts-extended = <&tlmm 157 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "active";
+		pinctrl-0 = <&hall_up_irq_active>;
+	};
+
+	hall-down@c {
+		compatible = "oplus,hall-mxm1120,down";
+		reg = <0x0c>;
+		vdd-supply = <&vreg_l10c_3p0>;
+		interrupts-extended = <&tlmm 138 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "active";
+		pinctrl-0 = <&hall_down_irq_active>;
+	};
+};
+
 &i2c11 {
 	/* OnePlus 8T routes AW8697 IRQ to TLMM GPIO 11 (8/8 Pro use GPIO 118). */
 	haptics@5a {
@@ -703,6 +747,22 @@
 		function = "gpio";
 		drive-strength = <2>;
 		bias-disable;
+	};
+
+	hall_up_irq_active: hall-up-irq-active-state {
+		pins = "gpio157";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-pull-up;
+	};
+
+	hall_down_irq_active: hall-down-irq-active-state {
+		pins = "gpio138";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-pull-up;
 	};
 };
 
