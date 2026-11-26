@@ -976,6 +976,9 @@ int oplus_tri_key_register_hall(struct oplus_hall_sensor *sensor)
 void oplus_tri_key_unregister_hall(struct oplus_hall_sensor *sensor)
 {
 	struct oplus_tri_key_dev *chip;
+	struct wakeup_source *ws = NULL;
+	struct proc_dir_entry *proc_dir = NULL;
+	struct input_dev *input_dev = NULL;
 	bool teardown_core = false;
 
 	if (!sensor || sensor->id >= DHALL_MAX)
@@ -1005,20 +1008,25 @@ void oplus_tri_key_unregister_hall(struct oplus_hall_sensor *sensor)
 	cancel_work_sync(&chip->dwork);
 	cancel_work_sync(&chip->timeout_work);
 
+	/*
+	 * Detach proc_dir/input_dev/ws under chip->lock, then unregister
+	 * outside chip->lock to avoid ABBA deadlock with procfs readers.
+	 */
 	mutex_lock(&chip->lock);
-	if (chip->ws) {
-		wakeup_source_unregister(chip->ws);
-		chip->ws = NULL;
-	}
-	if (chip->proc_dir) {
-		remove_proc_subtree("tristatekey", NULL);
-		chip->proc_dir = NULL;
-	}
-	if (chip->input_dev) {
-		input_unregister_device(chip->input_dev);
-		chip->input_dev = NULL;
-	}
+	ws = chip->ws;
+	chip->ws = NULL;
+	proc_dir = chip->proc_dir;
+	chip->proc_dir = NULL;
+	input_dev = chip->input_dev;
+	chip->input_dev = NULL;
 	mutex_unlock(&chip->lock);
+
+	if (proc_dir)
+		remove_proc_subtree("tristatekey", NULL);
+	if (input_dev)
+		input_unregister_device(input_dev);
+	if (ws)
+		wakeup_source_unregister(ws);
 
 	if (teardown_core) {
 		g_tri_key = NULL;
