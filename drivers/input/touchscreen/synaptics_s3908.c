@@ -20,6 +20,7 @@
 #include <linux/property.h>
 #include <linux/of.h>
 #include <linux/regulator/consumer.h>
+#include <linux/unaligned.h>
 
 /*
  * The TCM oncell interface uses a command byte, which may be followed by additional
@@ -51,12 +52,43 @@
  * also used to determine when the firmware has finished booting.
  */
 #define TCM_GET_APPLICATION_INFO		0x20
+#define TCM_SET_DYNAMIC_CONFIG			0x24
+#define TCM_GET_TOUCH_REPORT_CONFIG		0x25
+
+#define TCM_MESSAGE_MARKER			0xa5
 
 #define MODE_APPLICATION			0x01
 
 #define APP_STATUS_OK				0x00
 #define APP_STATUS_BOOTING			0x01
 #define APP_STATUS_UPDATING			0x02
+
+/* Dynamic config IDs */
+#define DC_DARK_ZONE_ENABLE			0xdd
+#define DC_GRIP_ENABLED				0xde
+
+/* Touch object classification */
+#define TCM_TOUCH_LIFT				0x00
+
+/* Touch report configuration codes */
+#define TOUCH_END				0x00
+#define TOUCH_FOREACH_ACTIVE_OBJECT		0x01
+#define TOUCH_FOREACH_OBJECT			0x02
+#define TOUCH_FOREACH_END			0x03
+#define TOUCH_PAD_TO_NEXT_BYTE			0x04
+#define TOUCH_OBJECT_N_INDEX			0x06
+#define TOUCH_OBJECT_N_CLASSIFICATION		0x07
+#define TOUCH_OBJECT_N_X_POSITION		0x08
+#define TOUCH_OBJECT_N_Y_POSITION		0x09
+#define TOUCH_OBJECT_N_Z			0x0a
+#define TOUCH_OBJECT_N_X_WIDTH			0x0b
+#define TOUCH_OBJECT_N_Y_WIDTH			0x0c
+#define TOUCH_NUM_OF_ACTIVE_OBJECTS		0x18
+
+#define TCM_MAX_OBJECTS				10
+#define TCM_BUF_SIZE				512
+#define TCM_MAX_REPORT_CONFIG_SIZE		256
+#define TCM_MAX_TOUCH_WIDTH			200
 
 /* status codes */
 #define REPORT_IDLE				0x00
@@ -88,7 +120,7 @@ struct tcm_cmd {
 	u8 cmd;
 	__le16 length;
 	u8 data[];
-};
+} __packed;
 
 struct tcm_identification {
 	struct tcm_message_header header;
@@ -128,22 +160,32 @@ struct tcm_data {
 	struct touchscreen_properties props;
 	struct regulator_bulk_data supplies[2];
 
+	u16 max_x;
+	u16 max_y;
+	u16 max_objects;
+
+	u8 report_config[TCM_MAX_REPORT_CONFIG_SIZE];
+	u16 report_config_len;
+	u16 report_obj_bits;
+
 	/* annoying state */
 	u16 buf_size;
-	char buf[256];
+	u8 buf[TCM_BUF_SIZE];
+	u8 irq_buf[TCM_BUF_SIZE];
 };
 
 static int tcm_send_cmd(struct tcm_data *tcm, struct tcm_cmd *cmd)
 {
 	struct i2c_client *client = tcm->client;
 	struct i2c_msg msg;
+	u16 payload_len = le16_to_cpu(cmd->length);
 	int ret;
 
-	dev_dbg(&client->dev, "sending command %#x\n", cmd->cmd);
+	dev_dbg(&client->dev, "sending command %#x len %u\n", cmd->cmd, payload_len);
 
 	msg.addr = client->addr;
 	msg.flags = 0;
-	msg.len = 1 + cmd->length;
+	msg.len = payload_len ? (sizeof(*cmd) + payload_len) : 1;
 	msg.buf = (u8 *)cmd;
 
 	ret = i2c_transfer(client->adapter, &msg, 1);
@@ -153,16 +195,6 @@ static int tcm_send_cmd(struct tcm_data *tcm, struct tcm_cmd *cmd)
 		return ret;
 	else
 		return -EIO;
-}
-
-static int tcm_send_cmd_noargs(struct tcm_data *tcm, u8 cmd)
-{
-	struct tcm_cmd c = {
-		.cmd = cmd,
-		.length = 0,
-	};
-
-	return tcm_send_cmd(tcm, &c);
 }
 
 static int tcm_recv_report(struct tcm_data *tcm,
@@ -186,12 +218,24 @@ static int tcm_recv_report(struct tcm_data *tcm,
 		return -EIO;
 }
 
-static int tcm_read_message(struct tcm_data *tcm, u8 cmd, void *buf, size_t length)
+static int tcm_read_message_len(struct tcm_data *tcm, u8 cmd, const void *payload,
+				u16 payload_len, void *buf, size_t length, u16 *out_len)
 {
+	u8 cmd_buf[sizeof(struct tcm_cmd) + 16];
+	struct tcm_cmd *c = (struct tcm_cmd *)cmd_buf;
+	const struct tcm_message_header *hdr;
 	int ret;
 
+	if (payload_len > sizeof(cmd_buf) - sizeof(*c))
+		return -EINVAL;
+
+	c->cmd = cmd;
+	c->length = cpu_to_le16(payload_len);
+	if (payload_len && payload)
+		memcpy(c->data, payload, payload_len);
+
 	reinit_completion(&tcm->response);
-	ret = tcm_send_cmd_noargs(tcm, cmd);
+	ret = tcm_send_cmd(tcm, c);
 	if (ret)
 		return ret;
 
@@ -199,16 +243,40 @@ static int tcm_read_message(struct tcm_data *tcm, u8 cmd, void *buf, size_t leng
 	if (ret == 0)
 		return -ETIMEDOUT;
 
+	hdr = (const struct tcm_message_header *)tcm->buf;
+	if (hdr->code != REPORT_OK && hdr->code != REPORT_IDENTIFY)
+		return -EIO;
+
+	if (out_len)
+		*out_len = tcm->buf_size;
+
 	if (buf) {
 		if (length > tcm->buf_size) {
-			dev_warn(&tcm->client->dev, "expected %zu bytes, got %u\n",
-				 length, tcm->buf_size);
+			dev_dbg(&tcm->client->dev, "expected %zu bytes, got %u\n",
+				length, tcm->buf_size);
 		}
-		length = min(tcm->buf_size, length);
+		length = min_t(size_t, tcm->buf_size, length);
 		memcpy(buf, tcm->buf, length);
 	}
 
 	return 0;
+}
+
+static int tcm_read_message(struct tcm_data *tcm, u8 cmd, void *buf, size_t length)
+{
+	return tcm_read_message_len(tcm, cmd, NULL, 0, buf, length, NULL);
+}
+
+static int tcm_set_dynamic_config(struct tcm_data *tcm, u8 id, u16 val)
+{
+	u8 payload[3] = {
+		id,
+		(u8)(val & 0xff),
+		(u8)(val >> 8),
+	};
+
+	return tcm_read_message_len(tcm, TCM_SET_DYNAMIC_CONFIG, payload,
+				    sizeof(payload), NULL, 0, NULL);
 }
 
 static void tcm_power_off(void *data)
@@ -281,59 +349,332 @@ struct tcm_report_point {
 	u8 rx;
 } __packed;
 
-static int tcm_handle_touch_report(struct tcm_data *tcm, const char *buf, size_t len)
+struct tcm_touch_object {
+	u8 status;
+	u16 x;
+	u16 y;
+	u16 width_x;
+	u16 width_y;
+	u8 z;
+};
+
+static u32 tcm_get_report_bits(const u8 *buf, size_t buf_len,
+			       unsigned int offset, unsigned int bits)
 {
+	unsigned int bit_offset = offset % 8;
+	unsigned int byte_offset = offset / 8;
+	unsigned int remaining = bits;
+	u32 output = 0;
+
+	if (bits == 0 || bits > 32 || offset + bits > buf_len * 8)
+		return 0;
+
+	while (remaining) {
+		unsigned int avail = 8 - bit_offset;
+		unsigned int take = min(avail, remaining);
+		u8 mask = (u8)(0xff >> (8 - take));
+		u8 val = (buf[byte_offset] >> bit_offset) & mask;
+
+		output |= (u32)val << (bits - remaining);
+		bit_offset = 0;
+		byte_offset++;
+		remaining -= take;
+	}
+
+	return output;
+}
+
+static u16 tcm_calc_obj_bits(const u8 *cfg, u16 cfg_len)
+{
+	unsigned int idx = 0;
+	unsigned int bits = 0;
+	bool in_loop = false;
+
+	while (idx < cfg_len) {
+		u8 code = cfg[idx++];
+
+		switch (code) {
+		case TOUCH_END:
+			return bits ? bits : 56;
+		case TOUCH_FOREACH_ACTIVE_OBJECT:
+		case TOUCH_FOREACH_OBJECT:
+			in_loop = true;
+			bits = 0;
+			break;
+		case TOUCH_FOREACH_END:
+			return bits ? bits : 56;
+		case TOUCH_PAD_TO_NEXT_BYTE:
+			if (in_loop)
+				bits = ALIGN(bits, 8);
+			break;
+		default:
+			if (idx >= cfg_len)
+				return bits ? bits : 56;
+			if (in_loop)
+				bits += cfg[idx];
+			idx++;
+			break;
+		}
+	}
+
+	return bits ? bits : 56;
+}
+
+static void tcm_report_objects(struct tcm_data *tcm,
+			       const struct tcm_touch_object *objs)
+{
+	u16 idx;
+
+	/* We don't need to report releases because we have INPUT_MT_DROP_UNUSED */
+	for (idx = 0; idx < tcm->max_objects; idx++) {
+		u16 major_width, minor_width;
+
+		if (objs[idx].status == TCM_TOUCH_LIFT)
+			continue;
+
+		if (objs[idx].x > tcm->max_x || objs[idx].y > tcm->max_y ||
+		    objs[idx].width_x > TCM_MAX_TOUCH_WIDTH ||
+		    objs[idx].width_y > TCM_MAX_TOUCH_WIDTH) {
+			dev_dbg(&tcm->client->dev,
+				"dropping anomalous touch idx=%u status=%u x=%u y=%u wx=%u wy=%u\n",
+				idx, objs[idx].status, objs[idx].x, objs[idx].y,
+				objs[idx].width_x, objs[idx].width_y);
+			continue;
+		}
+
+		minor_width = objs[idx].width_x;
+		major_width = objs[idx].width_y;
+		if (minor_width > major_width)
+			swap(major_width, minor_width);
+
+		dev_dbg(&tcm->client->dev, "touch report: idx %u x %u y %u\n",
+			idx, objs[idx].x, objs[idx].y);
+
+		input_mt_slot(tcm->input, idx);
+		input_mt_report_slot_state(tcm->input, MT_TOOL_FINGER, true);
+
+		touchscreen_report_pos(tcm->input, &tcm->props,
+				       objs[idx].x, objs[idx].y, true);
+
+		input_report_abs(tcm->input, ABS_MT_TOUCH_MAJOR, major_width);
+		input_report_abs(tcm->input, ABS_MT_TOUCH_MINOR, minor_width);
+		input_report_abs(tcm->input, ABS_MT_PRESSURE,
+				 objs[idx].z ? objs[idx].z : 1);
+	}
+
+	input_mt_sync_frame(tcm->input);
+	input_sync(tcm->input);
+}
+
+static int tcm_handle_touch_report_dynamic(struct tcm_data *tcm,
+					   u8 *payload, size_t payload_len)
+{
+	struct tcm_touch_object objs[TCM_MAX_OBJECTS] = { 0 };
+	const u8 *cfg = tcm->report_config;
+	u16 cfg_len = tcm->report_config_len;
+	unsigned int idx = 0, next = 0, end_of_foreach = 0;
+	unsigned int offset = 0, obj = 0, objects = 0, active_objects = 0;
+	unsigned int min_obj_bits = min_t(unsigned int, tcm->report_obj_bits, 56);
+	bool active_only = false, has_num_active = false;
+
+	/*
+	 * Aftermarket replacement OnePlus 8T panels may insert a 2-byte
+	 * 0xa5 0x03 transient prefix at bytes [8..9] when (payload[7] & 0x0f)
+	 * is 0, shifting the touch payload and dropping quick taps.
+	 */
+	if (payload_len >= 10 && (payload[7] & 0x0f) == 0x00 &&
+	    payload[8] == TCM_MESSAGE_MARKER && payload[9] == REPORT_CONTINUED_READ) {
+		memmove(&payload[8], &payload[10], payload_len - 10);
+		memset(&payload[payload_len - 2], 0, 2);
+	}
+
+	while (idx < cfg_len) {
+		u8 code = cfg[idx++];
+		unsigned int bits;
+		u32 data;
+
+		switch (code) {
+		case TOUCH_END:
+			goto done;
+		case TOUCH_FOREACH_ACTIVE_OBJECT:
+			obj = 0;
+			objects = 0;
+			next = idx;
+			active_only = true;
+			if ((has_num_active && active_objects == 0) ||
+			    offset + min_obj_bits > payload_len * 8) {
+				while (idx < cfg_len && cfg[idx] != TOUCH_FOREACH_END) {
+					u8 skip = cfg[idx++];
+
+					if (skip != TOUCH_PAD_TO_NEXT_BYTE && idx < cfg_len)
+						idx++;
+				}
+				if (idx < cfg_len)
+					idx++;
+			}
+			break;
+		case TOUCH_FOREACH_OBJECT:
+			obj = 0;
+			next = idx;
+			active_only = false;
+			break;
+		case TOUCH_FOREACH_END:
+			end_of_foreach = idx;
+			if (active_only) {
+				if (has_num_active) {
+					objects++;
+					if (objects < active_objects)
+						idx = next;
+				} else if (offset + tcm->report_obj_bits <= payload_len * 8) {
+					idx = next;
+				}
+			} else {
+				obj++;
+				if (obj < tcm->max_objects)
+					idx = next;
+			}
+			break;
+		case TOUCH_PAD_TO_NEXT_BYTE:
+			offset = ALIGN(offset, 8);
+			break;
+		case TOUCH_OBJECT_N_INDEX:
+			if (idx >= cfg_len)
+				goto done;
+			bits = cfg[idx++];
+			obj = tcm_get_report_bits(payload, payload_len, offset, bits);
+			offset += bits;
+			break;
+		case TOUCH_OBJECT_N_CLASSIFICATION:
+			if (idx >= cfg_len)
+				goto done;
+			bits = cfg[idx++];
+			data = tcm_get_report_bits(payload, payload_len, offset, bits);
+			if (obj < tcm->max_objects)
+				objs[obj].status = data;
+			offset += bits;
+			break;
+		case TOUCH_OBJECT_N_X_POSITION:
+			if (idx >= cfg_len)
+				goto done;
+			bits = cfg[idx++];
+			data = tcm_get_report_bits(payload, payload_len, offset, bits);
+			if (obj < tcm->max_objects)
+				objs[obj].x = data & 0x0fff;
+			offset += bits;
+			break;
+		case TOUCH_OBJECT_N_Y_POSITION:
+			if (idx >= cfg_len)
+				goto done;
+			bits = cfg[idx++];
+			data = tcm_get_report_bits(payload, payload_len, offset, bits);
+			if (obj < tcm->max_objects)
+				objs[obj].y = data & 0x0fff;
+			offset += bits;
+			break;
+		case TOUCH_OBJECT_N_Z:
+			if (idx >= cfg_len)
+				goto done;
+			bits = cfg[idx++];
+			data = tcm_get_report_bits(payload, payload_len, offset, bits);
+			if (obj < tcm->max_objects)
+				objs[obj].z = data;
+			offset += bits;
+			break;
+		case TOUCH_OBJECT_N_X_WIDTH:
+			if (idx >= cfg_len)
+				goto done;
+			bits = cfg[idx++];
+			data = tcm_get_report_bits(payload, payload_len, offset, bits);
+			if (obj < tcm->max_objects)
+				objs[obj].width_x = data & 0x0fff;
+			offset += bits;
+			break;
+		case TOUCH_OBJECT_N_Y_WIDTH:
+			if (idx >= cfg_len)
+				goto done;
+			bits = cfg[idx++];
+			data = tcm_get_report_bits(payload, payload_len, offset, bits);
+			if (obj < tcm->max_objects)
+				objs[obj].width_y = data & 0x0fff;
+			offset += bits;
+			break;
+		case TOUCH_NUM_OF_ACTIVE_OBJECTS:
+			if (idx >= cfg_len)
+				goto done;
+			bits = cfg[idx++];
+			active_objects = tcm_get_report_bits(payload, payload_len, offset, bits);
+			has_num_active = true;
+			offset += bits;
+			if (active_objects == 0 && end_of_foreach)
+				idx = end_of_foreach;
+			break;
+		default:
+			if (idx >= cfg_len)
+				goto done;
+			bits = cfg[idx++];
+			offset += bits;
+			break;
+		}
+	}
+
+done:
+	tcm_report_objects(tcm, objs);
+	return 0;
+}
+
+static int tcm_handle_touch_report(struct tcm_data *tcm, u8 *buf, size_t len)
+{
+	struct tcm_touch_object objs[TCM_MAX_OBJECTS] = { 0 };
 	const struct tcm_report_point *point;
+
 	/* If the input device hasn't registered yet then we can't do anything */
 	if (!tcm->input)
+		return 0;
+
+	if (len <= sizeof(struct tcm_message_header))
 		return 0;
 
 	buf += sizeof(struct tcm_message_header);
 	len -= sizeof(struct tcm_message_header);
 
 	dev_dbg(&tcm->client->dev, "touch report len %zu\n", len);
+
+	if (tcm->report_config_len > 0)
+		return tcm_handle_touch_report_dynamic(tcm, buf, len);
+
+	if (len < 1 + sizeof(*point)) {
+		tcm_report_objects(tcm, objs);
+		return 0;
+	}
+
 	if ((len - 3) % sizeof(*point))
-		dev_err(&tcm->client->dev, "invalid touch report length\n");
+		dev_dbg(&tcm->client->dev, "unexpected legacy touch report length %zu\n", len);
 
 	buf++; /* Skip the FPS report */
 
-	/* We don't need to report releases because we have INPUT_MT_DROP_UNUSED */
-	for (int i = 0; i < (len - 1) / sizeof(*point); i++) {
-		u8 major_width, minor_width;
-		u16 idx, x, y;
+	for (size_t i = 0; i < (len - 1) / sizeof(*point); i++) {
 		u32 _point;
+		u16 idx;
+		u8 status;
 
-		point = (struct tcm_report_point *)buf;
+		point = (const struct tcm_report_point *)buf;
 		_point = le32_to_cpu(point->point);
 
-		minor_width = point->width_x;
-		major_width = point->width_y;
-
-		if (minor_width > major_width)
-			swap(major_width, minor_width);
-
 		idx = _point & 0xf;
-		x = (_point >> 8) & 0xfff;
-		y = (_point >> 20) & 0xfff;
-
-		dev_dbg(&tcm->client->dev, "touch report: idx %u x %u y %u\n",
-			idx, x, y);
-
-		input_mt_slot(tcm->input, idx);
-		input_mt_report_slot_state(tcm->input, MT_TOOL_FINGER, true);
-
-		touchscreen_report_pos(tcm->input, &tcm->props, x, y, true);
-
-		input_report_abs(tcm->input, ABS_MT_TOUCH_MAJOR, major_width);
-		input_report_abs(tcm->input, ABS_MT_TOUCH_MINOR, minor_width);
-		input_report_abs(tcm->input, ABS_MT_PRESSURE, point->z);
+		status = (_point >> 4) & 0xf;
+		if (idx < tcm->max_objects) {
+			objs[idx].status = status;
+			objs[idx].x = (_point >> 8) & 0xfff;
+			objs[idx].y = (_point >> 20) & 0xfff;
+			objs[idx].z = point->z;
+			objs[idx].width_x = point->width_x;
+			objs[idx].width_y = point->width_y;
+		}
 
 		buf += sizeof(*point);
 	}
 
-	input_mt_sync_frame(tcm->input);
-	input_sync(tcm->input);
-
+	tcm_report_objects(tcm, objs);
 	return 0;
 }
 
@@ -341,14 +682,19 @@ static irqreturn_t tcm_report_irq(int irq, void *data)
 {
 	struct tcm_data *tcm = data;
 	struct tcm_message_header *header;
-	char buf[256];
+	u8 *buf = tcm->irq_buf;
 	u16 len;
 	int ret;
 
 	header = (struct tcm_message_header *)buf;
-	ret = tcm_recv_report(tcm, buf, sizeof(buf));
+	ret = tcm_recv_report(tcm, buf, sizeof(tcm->irq_buf));
 	if (ret) {
 		dev_err(&tcm->client->dev, "failed to read report: %d\n", ret);
+		return IRQ_HANDLED;
+	}
+
+	if (header->marker != TCM_MESSAGE_MARKER) {
+		dev_dbg(&tcm->client->dev, "Ignoring invalid marker %#x\n", header->marker);
 		return IRQ_HANDLED;
 	}
 
@@ -360,34 +706,36 @@ static irqreturn_t tcm_report_irq(int irq, void *data)
 	case REPORT_RAW:
 	case REPORT_DEBUG:
 	case REPORT_TOUCH_HOLD:
+	case REPORT_NOT_IMPLEMENTED:
+	case REPORT_ERROR:
 		break;
 	default:
 		dev_dbg(&tcm->client->dev, "Ignoring report %#x\n", header->code);
 		return IRQ_HANDLED;
 	}
 
-	len = le32_to_cpu(header->length);
+	len = le16_to_cpu(header->length);
 
 	dev_dbg(&tcm->client->dev, "report %#x len %u\n", header->code, len);
 	print_hex_dump_bytes("report: ", DUMP_PREFIX_OFFSET, buf,
-			     min(sizeof(buf), len + sizeof(*header)));
+			     min_t(size_t, sizeof(tcm->irq_buf), len + sizeof(*header)));
 
-	if (len > sizeof(buf) - sizeof(*header)) {
-		dev_err(&tcm->client->dev, "report too long\n");
+	if (len > sizeof(tcm->irq_buf) - sizeof(*header)) {
+		dev_err(&tcm->client->dev, "report too long (%u)\n", len);
 		return IRQ_HANDLED;
 	}
 
-	/* Check if this is a read response or an indication. For indications
-	 * (user touched the screen) we just parse the report directly.
-	 */
-	if (completion_done(&tcm->response) && header->code == REPORT_TOUCH) {
+	/* Touch indications are always handled directly and must not wake command waiters. */
+	if (header->code == REPORT_TOUCH) {
 		tcm_handle_touch_report(tcm, buf, len + sizeof(*header));
 		return IRQ_HANDLED;
 	}
 
-	tcm->buf_size = len + sizeof(*header);
-	memcpy(tcm->buf, buf, len + sizeof(*header));
-	complete(&tcm->response);
+	if (!completion_done(&tcm->response)) {
+		tcm->buf_size = len + sizeof(*header);
+		memcpy(tcm->buf, buf, len + sizeof(*header));
+		complete(&tcm->response);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -397,6 +745,8 @@ static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 	int ret;
 	struct tcm_identification id = { 0 };
 	struct tcm_app_info app_info = { 0 };
+	u8 cfg_resp[sizeof(struct tcm_message_header) + TCM_MAX_REPORT_CONFIG_SIZE];
+	u16 cfg_total = 0;
 	u16 status;
 
 	/*
@@ -433,6 +783,37 @@ static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 
 	*max_x = le16_to_cpu(app_info.max_x);
 	*max_y = le16_to_cpu(app_info.max_y);
+	tcm->max_x = *max_x;
+	tcm->max_y = *max_y;
+	tcm->max_objects = clamp_t(u16, get_unaligned_le16(app_info.max_objects),
+				   1, TCM_MAX_OBJECTS);
+
+	ret = tcm_read_message_len(tcm, TCM_GET_TOUCH_REPORT_CONFIG, NULL, 0,
+				   cfg_resp, sizeof(cfg_resp), &cfg_total);
+	if (!ret && cfg_total > sizeof(struct tcm_message_header)) {
+		u16 payload_len = min_t(u16, cfg_total - sizeof(struct tcm_message_header),
+					TCM_MAX_REPORT_CONFIG_SIZE);
+
+		memcpy(tcm->report_config,
+		       cfg_resp + sizeof(struct tcm_message_header), payload_len);
+		tcm->report_config_len = payload_len;
+		tcm->report_obj_bits = tcm_calc_obj_bits(tcm->report_config, payload_len);
+		dev_info(&tcm->client->dev,
+			 "loaded dynamic touch report config (%u bytes, %u bits/obj, %u max_obj)\n",
+			 payload_len, tcm->report_obj_bits, tcm->max_objects);
+	} else {
+		dev_warn(&tcm->client->dev,
+			 "failed to fetch touch report config (%d), using legacy layout\n", ret);
+	}
+
+	/*
+	 * Best-effort disable firmware edge grip / dark zones that cause dead
+	 * edges and corners on aftermarket OnePlus 8T replacement panels.
+	 */
+	if (tcm_set_dynamic_config(tcm, DC_GRIP_ENABLED, 0))
+		dev_dbg(&tcm->client->dev, "DC_GRIP_ENABLED not supported\n");
+	if (tcm_set_dynamic_config(tcm, DC_DARK_ZONE_ENABLE, 0))
+		dev_dbg(&tcm->client->dev, "DC_DARK_ZONE_ENABLE not supported\n");
 
 	return 0;
 }
