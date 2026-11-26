@@ -580,6 +580,8 @@ void vpanic(const char *fmt, va_list args)
 		 */
 		if (panic_reboot_mode != REBOOT_UNDEFINED)
 			reboot_mode = panic_reboot_mode;
+		else
+			reboot_mode = REBOOT_WARM;
 		kmsg_dump(KMSG_DUMP_EMERG);
 		system_state = SYSTEM_RESTART;
 		machine_restart("recovery");

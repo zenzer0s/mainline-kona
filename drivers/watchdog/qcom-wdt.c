@@ -285,6 +285,13 @@ static int qcom_wdt_probe(struct platform_device *pdev)
 	watchdog_init_timeout(&wdt->wdd, 0, dev);
 
 	/*
+	 * Give bark-to-bite pretimeout enough headroom (5s) so a pretimeout
+	 * panic (panic=3) can flush ramoops and warm-reboot before WDT bite.
+	 */
+	if (wdt->wdd.pretimeout)
+		wdt->wdd.pretimeout = min(wdt->wdd.timeout / 2, 5U);
+
+	/*
 	 * If WDT is already running, call WDT start which
 	 * will stop the WDT, set timeouts as bootloader
 	 * might use different ones and set running bit
