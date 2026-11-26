@@ -24,6 +24,20 @@
 		};
 	};
 
+	conn_therm_sensor: thermal-sensor-conn {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pm8150b_adc ADC5_AMUX_THM4_30K_PU>;
+		io-channel-names = "sensor-channel";
+	};
+
+	usb_supp_therm_sensor: thermal-sensor-usb-supp {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pm8150b_adc ADC5_GPIO4_30K_PU>;
+		io-channel-names = "sensor-channel";
+	};
+
 	thermal-zones {
 		cam-flash-thermal {
 			polling-delay-passive = <0>;
@@ -42,7 +56,7 @@
 		conn-thermal {
 			polling-delay-passive = <0>;
 			polling-delay = <0>;
-			thermal-sensors = <&pm8150b_adc_tm 0>;
+			thermal-sensors = <&conn_therm_sensor>;
 
 			trips {
 				active-config0 {
@@ -56,7 +70,7 @@
 		usb-supp-thermal {
 			polling-delay-passive = <0>;
 			polling-delay = <0>;
-			thermal-sensors = <&pm8150b_adc_tm 2>;
+			thermal-sensors = <&usb_supp_therm_sensor>;
 
 			trips {
 				active-config0 {
@@ -136,7 +150,7 @@
 		skin-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <0>;
-			thermal-sensors = <&pm8150b_adc_tm 1>;
+			thermal-sensors = <&pm8150b_adc_tm 0>;
 
 			trips {
 				skin_trip0: trip-point0 {
@@ -440,25 +454,11 @@
 &pm8150b_adc_tm {
 	status = "okay";
 
-	conn-therm@0 {
+	skin-therm@0 {
 		reg = <0>;
-		io-channels = <&pm8150b_adc ADC5_AMUX_THM4_30K_PU>;
-		qcom,ratiometric;
-		qcom,hw-settle-time-us = <700>;
-	};
-
-	skin-therm@1 {
-		reg = <1>;
 		io-channels = <&pm8150b_adc ADC5_AMUX_THM1_100K_PU>;
 		qcom,ratiometric;
 		qcom,hw-settle-time-us = <200>;
-	};
-
-	usb-supp-therm@2 {
-		reg = <2>;
-		io-channels = <&pm8150b_adc ADC5_GPIO4_30K_PU>;
-		qcom,ratiometric;
-		qcom,hw-settle-time-us = <700>;
 	};
 };
 
