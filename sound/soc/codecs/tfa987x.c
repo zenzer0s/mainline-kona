@@ -92,10 +92,39 @@
 
 struct tfa987x_priv {
 	struct mutex lock;
-	bool enabled;
 	bool receiver_mode;
-	bool playing;
+	bool powered;
 };
+
+static int tfa987x_pwup_event(struct snd_soc_dapm_widget *w,
+			      struct snd_kcontrol *kcontrol, int event)
+{
+	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+	struct tfa987x_priv *priv = snd_soc_component_get_drvdata(component);
+
+	mutex_lock(&priv->lock);
+	switch (event) {
+	case SND_SOC_DAPM_POST_PMU:
+		priv->powered = true;
+		snd_soc_component_update_bits(component, TFA987X_TDM_CFG3,
+					      TFA987X_TDM_CFG3_SPKE_MSK,
+					      TFA987X_TDM_CFG3_SPKE_MSK);
+		snd_soc_component_update_bits(component, TFA987X_SYS_CTRL0,
+					      TFA987X_SYS_CTRL0_AMPE_MSK,
+					      TFA987X_SYS_CTRL0_AMPE_MSK);
+		break;
+	case SND_SOC_DAPM_PRE_PMD:
+		priv->powered = false;
+		snd_soc_component_update_bits(component, TFA987X_SYS_CTRL0,
+					      TFA987X_SYS_CTRL0_AMPE_MSK, 0);
+		snd_soc_component_update_bits(component, TFA987X_TDM_CFG3,
+					      TFA987X_TDM_CFG3_SPKE_MSK, 0);
+		break;
+	}
+	mutex_unlock(&priv->lock);
+
+	return 0;
+}
 
 static int tfa987x_digital_mute(struct snd_soc_dai *codec_dai, int mute, int stream)
 {
@@ -107,49 +136,12 @@ static int tfa987x_digital_mute(struct snd_soc_dai *codec_dai, int mute, int str
 		return 0;
 
 	mutex_lock(&priv->lock);
-	priv->playing = !mute;
-	val = (!mute && priv->enabled) ? TFA987X_SYS_CTRL0_AMPE_MSK : 0;
+	val = (!mute && priv->powered) ? TFA987X_SYS_CTRL0_AMPE_MSK : 0;
 	snd_soc_component_update_bits(component, TFA987X_SYS_CTRL0,
 				      TFA987X_SYS_CTRL0_AMPE_MSK, val);
 	mutex_unlock(&priv->lock);
 
 	return 0;
-}
-
-static int tfa987x_playback_switch_get(struct snd_kcontrol *kcontrol,
-				       struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
-	struct tfa987x_priv *priv = snd_soc_component_get_drvdata(component);
-
-	mutex_lock(&priv->lock);
-	ucontrol->value.integer.value[0] = priv->enabled;
-	mutex_unlock(&priv->lock);
-
-	return 0;
-}
-
-static int tfa987x_playback_switch_put(struct snd_kcontrol *kcontrol,
-				       struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
-	struct tfa987x_priv *priv = snd_soc_component_get_drvdata(component);
-	bool val = !!ucontrol->value.integer.value[0];
-	int changed;
-
-	mutex_lock(&priv->lock);
-	changed = (priv->enabled != val);
-	if (changed) {
-		priv->enabled = val;
-		if (priv->playing) {
-			snd_soc_component_update_bits(component, TFA987X_SYS_CTRL0,
-						      TFA987X_SYS_CTRL0_AMPE_MSK,
-						      val ? TFA987X_SYS_CTRL0_AMPE_MSK : 0);
-		}
-	}
-	mutex_unlock(&priv->lock);
-
-	return changed;
 }
 
 static int tfa987x_receiver_mode_get(struct snd_kcontrol *kcontrol,
@@ -195,22 +187,27 @@ static int tfa987x_receiver_mode_put(struct snd_kcontrol *kcontrol,
 	return changed;
 }
 
+static const struct snd_kcontrol_new tfa987x_playback_switch =
+	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0);
+
 static const struct snd_kcontrol_new tfa987x_controls[] = {
-	SOC_SINGLE_BOOL_EXT("Playback Switch", 0,
-			    tfa987x_playback_switch_get,
-			    tfa987x_playback_switch_put),
 	SOC_SINGLE_BOOL_EXT("Receiver Mode Switch", 0,
 			    tfa987x_receiver_mode_get,
 			    tfa987x_receiver_mode_put),
 };
 
 static const struct snd_soc_dapm_widget tfa987x_dapm_widgets[] = {
+	SND_SOC_DAPM_SWITCH("Playback", SND_SOC_NOPM, 0, 0,
+			    &tfa987x_playback_switch),
+	SND_SOC_DAPM_OUT_DRV_E("PWUP", TFA987X_SYS_CTRL0, 0, 1, NULL, 0,
+			       tfa987x_pwup_event,
+			       SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
 	SND_SOC_DAPM_OUTPUT("Speaker"),
-	SND_SOC_DAPM_OUT_DRV_E("PWUP", TFA987X_SYS_CTRL0, 0, 1, NULL, 0, NULL, 0),
 };
 
 static const struct snd_soc_dapm_route tfa987x_dapm_routes[] = {
-	{"PWUP", NULL, "HiFi Playback"},
+	{"Playback", "Switch", "HiFi Playback"},
+	{"PWUP", NULL, "Playback"},
 	{"Speaker", NULL, "PWUP"},
 };
 
@@ -337,7 +334,6 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 		return -ENOMEM;
 
 	mutex_init(&priv->lock);
-	priv->enabled = true;
 	i2c_set_clientdata(i2c, priv);
 
 	rmap = devm_regmap_init_i2c(i2c, &tfa987x_regmap_config);
@@ -406,9 +402,11 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 				 TFA987X_MODE1_DET1_LPM1MODE_MSK,
 				 FIELD_PREP(TFA987X_MODE1_DET1_LPM1MODE_MSK, 1));
 
-	/* Turn on this thing */
+	/* Keep amplifier powered down until DAPM enables its Playback Switch */
 	regmap_update_bits(rmap, TFA987X_SYS_CTRL0,
-				 TFA987X_SYS_CTRL0_PWDN_MSK, 0);
+				 TFA987X_SYS_CTRL0_PWDN_MSK |
+				 TFA987X_SYS_CTRL0_AMPE_MSK,
+				 TFA987X_SYS_CTRL0_PWDN_MSK);
 
 	regmap_update_bits(rmap, TFA987X_SYS_CTRL1,
 				 TFA987X_SYS_CTRL1_MANSCONF_MSK,
