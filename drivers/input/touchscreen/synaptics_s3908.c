@@ -231,6 +231,8 @@ struct tcm_data {
 	struct mutex mode_mutex;
 	struct work_struct screen_work;
 	struct proc_dir_entry *proc_dir;
+	struct proc_dir_entry *proc_gesture;
+	struct proc_dir_entry *proc_game;
 	u32 gesture_mask;
 	u16 default_noise_length;
 	bool zero_len_cmd_3byte;
@@ -330,12 +332,12 @@ static int tcm_read_message_len(struct tcm_data *tcm, u8 cmd, const void *payloa
 		return ret;
 	}
 
-	ret = wait_for_completion_timeout(&tcm->response, msecs_to_jiffies(500));
+	ret = wait_for_completion_timeout(&tcm->response, msecs_to_jiffies(300));
 	if (ret == 0) {
 		/*
 		 * Fallback poll if ATTN was missed or level-latched during init.
 		 */
-		for (attempt = 0; attempt < 25 && !completion_done(&tcm->response); attempt++) {
+		for (attempt = 0; attempt < 10 && !completion_done(&tcm->response); attempt++) {
 			msleep(20);
 			tcm_read_one_message(tcm);
 		}
@@ -443,7 +445,7 @@ static void tcm_power_off(void *data)
 {
 	struct tcm_data *tcm = data;
 
-	disable_irq(tcm->client->irq);
+	gpiod_set_value_cansleep(tcm->reset_gpio, 1);
 	regulator_bulk_disable(ARRAY_SIZE(tcm->supplies), tcm->supplies);
 }
 
@@ -1077,99 +1079,156 @@ static const u8 tcm_normal_report_config[] = {
 
 static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 {
-	int ret, retry;
+	int ret = 0, retry;
 	struct tcm_identification id = { 0 };
 	struct tcm_app_info app_info = { 0 };
 	u8 cfg_buf[sizeof(struct tcm_message_header) + TCM_MAX_REPORT_CONFIG_SIZE] = { 0 };
 	u16 cfg_total = 0;
-	u16 cfg_max_len;
-	u16 status;
+	u16 cfg_max_len = 0;
+	u16 status = APP_STATUS_OK;
 	u32 dt_x = 0, dt_y = 0;
+	bool got_id = false;
+	bool got_app_info = false;
 
 	/*
-	 * Identify first (matching OPlus synaptics_tcm_oncell). Try 1-byte
-	 * zero-payload commands first (required by aftermarket replacement
-	 * panels that ignore 3-byte [cmd 00 00] frames), and fall back to
-	 * 3-byte command headers if both 0x02 and 0x14 time out.
+	 * Prefer the automatic power-on REPORT_IDENTIFY captured when reset
+	 * was released with the IRQ already armed (matching OPlus
+	 * synaptics_tcm_oncell). Only send explicit TCM_IDENTIFY (0x02) /
+	 * TCM_RUN_APPLICATION_FIRMWARE (0x14) if no boot identify arrived.
 	 */
-	for (retry = 0; retry < 2; retry++) {
-		tcm->zero_len_cmd_3byte = (retry == 1);
-		memset(&id, 0, sizeof(id));
-
-		ret = tcm_read_message(tcm, TCM_IDENTIFY, &id, sizeof(id));
-		if (!ret)
-			break;
-
-		dev_warn(&tcm->client->dev,
-			 "TCM_IDENTIFY (%u-byte) failed (%d), trying RUN_APPLICATION_FIRMWARE\n",
-			 tcm->zero_len_cmd_3byte ? 3 : 1, ret);
-		ret = tcm_read_message(tcm, TCM_RUN_APPLICATION_FIRMWARE, &id, sizeof(id));
-		if (!ret)
-			break;
-
-		if (ret != -ETIMEDOUT)
-			break;
-	}
-	if (ret) {
-		dev_err(&tcm->client->dev, "failed to identify device: %d\n", ret);
-		return ret;
-	}
-
-	if (id.mode == 0) {
-		/*
-		 * Some panels answer TCM_RUN_APPLICATION_FIRMWARE with an
-		 * empty REPORT_OK when already in application mode; query
-		 * TCM_IDENTIFY to populate part_number/mode.
-		 */
-		msleep(20);
-		if (tcm_read_message(tcm, TCM_IDENTIFY, &id, sizeof(id)))
-			id.mode = MODE_APPLICATION;
-	}
-
-	if (id.mode != MODE_APPLICATION) {
+	if (completion_done(&tcm->response) &&
+	    tcm->buf_size >= sizeof(struct tcm_message_header) + 2 &&
+	    tcm->buf[0] == TCM_MESSAGE_MARKER &&
+	    tcm->buf[1] == REPORT_IDENTIFY) {
+		memcpy(&id, tcm->buf, min_t(size_t, sizeof(id), tcm->buf_size));
+		got_id = true;
 		dev_info(&tcm->client->dev,
-			 "controller in mode %#x, switching to application firmware\n", id.mode);
-		ret = tcm_read_message(tcm, TCM_RUN_APPLICATION_FIRMWARE, NULL, 0);
-		if (ret) {
-			dev_err(&tcm->client->dev,
-				"failed to run application firmware: %d\n", ret);
-			return ret;
-		}
-		msleep(20);
-		memset(&id, 0, sizeof(id));
-		ret = tcm_read_message(tcm, TCM_IDENTIFY, &id, sizeof(id));
-		if (ret) {
-			dev_err(&tcm->client->dev, "failed post-switch identify: %d\n", ret);
-			return ret;
+			 "captured power-on REPORT_IDENTIFY (%.16s v%d mode %#x)\n",
+			 id.part_number, id.version, id.mode);
+	}
+
+	if (!got_id) {
+		for (retry = 0; retry < 2; retry++) {
+			tcm->zero_len_cmd_3byte = (retry == 1);
+			memset(&id, 0, sizeof(id));
+
+			ret = tcm_read_message(tcm, TCM_IDENTIFY, &id, sizeof(id));
+			if (!ret) {
+				got_id = true;
+				break;
+			}
+			if (ret != -ETIMEDOUT && ret != -EIO)
+				return ret;
+
+			dev_warn(&tcm->client->dev,
+				 "TCM_IDENTIFY (%u-byte) failed (%d), trying RUN_APPLICATION_FIRMWARE\n",
+				 tcm->zero_len_cmd_3byte ? 3 : 1, ret);
+			ret = tcm_read_message(tcm, TCM_RUN_APPLICATION_FIRMWARE,
+					       &id, sizeof(id));
+			if (!ret) {
+				got_id = true;
+				break;
+			}
+			if (ret != -ETIMEDOUT && ret != -EIO)
+				return ret;
 		}
 	}
 
-	dev_info(&tcm->client->dev, "Synaptics TCM %.16s v%d mode %#x\n",
-		 id.part_number, id.version, id.mode);
-	if (id.mode != MODE_APPLICATION) {
-		/* We don't support firmware updates or anything else */
-		dev_err(&tcm->client->dev, "Device is not in application mode\n");
-		return -ENODEV;
+	if (!got_id) {
+		/*
+		 * Some aftermarket replacement panels ACK I2C transfers cleanly
+		 * and boot directly into application mode, but silently drop
+		 * zero-payload 0x02/0x14 commands. Match OPlus syna_get_chip_info()
+		 * by continuing into application setup instead of aborting probe.
+		 */
+		dev_warn(&tcm->client->dev,
+			 "identify commands timed out (%d); assuming application mode\n",
+			 ret);
+		tcm->zero_len_cmd_3byte = false;
+		id.mode = MODE_APPLICATION;
+	} else {
+		if (id.mode == 0) {
+			/*
+			 * Some panels answer TCM_RUN_APPLICATION_FIRMWARE with
+			 * an empty REPORT_OK when already in application mode;
+			 * query TCM_IDENTIFY to populate part_number/mode.
+			 */
+			msleep(20);
+			if (tcm_read_message(tcm, TCM_IDENTIFY, &id, sizeof(id)))
+				id.mode = MODE_APPLICATION;
+		}
+
+		if (id.mode != MODE_APPLICATION) {
+			dev_info(&tcm->client->dev,
+				 "controller in mode %#x, switching to application firmware\n",
+				 id.mode);
+			ret = tcm_read_message(tcm, TCM_RUN_APPLICATION_FIRMWARE, NULL, 0);
+			if (ret) {
+				dev_err(&tcm->client->dev,
+					"failed to run application firmware: %d\n", ret);
+				return ret;
+			}
+			msleep(20);
+			memset(&id, 0, sizeof(id));
+			ret = tcm_read_message(tcm, TCM_IDENTIFY, &id, sizeof(id));
+			if (ret) {
+				dev_err(&tcm->client->dev,
+					"failed post-switch identify: %d\n", ret);
+				return ret;
+			}
+		}
+
+		dev_info(&tcm->client->dev, "Synaptics TCM %.16s v%d mode %#x\n",
+			 id.part_number, id.version, id.mode);
+		if (id.mode != MODE_APPLICATION) {
+			/* We don't support firmware updates or anything else */
+			dev_err(&tcm->client->dev, "Device is not in application mode\n");
+			return -ENODEV;
+		}
 	}
 
 	retry = 0;
 	do {
 		msleep(20);
-		ret = tcm_read_message(tcm, TCM_GET_APPLICATION_INFO, &app_info, sizeof(app_info));
+		ret = tcm_read_message(tcm, TCM_GET_APPLICATION_INFO,
+				       &app_info, sizeof(app_info));
+		if (ret == -ETIMEDOUT && retry == 0 && !got_id) {
+			tcm->zero_len_cmd_3byte = !tcm->zero_len_cmd_3byte;
+			ret = tcm_read_message(tcm, TCM_GET_APPLICATION_INFO,
+					       &app_info, sizeof(app_info));
+		}
 		if (ret) {
+			if (ret == -ETIMEDOUT) {
+				dev_warn(&tcm->client->dev,
+					 "TCM_GET_APPLICATION_INFO timed out; using DT/fallback dimensions\n");
+				break;
+			}
 			dev_err(&tcm->client->dev, "failed to get application info: %d\n", ret);
 			return ret;
 		}
+		got_app_info = true;
 		status = le16_to_cpu(app_info.status);
 	} while ((status == APP_STATUS_BOOTING || status == APP_STATUS_UPDATING) &&
 		 ++retry < 25);
 
-	dev_info(&tcm->client->dev, "Application firmware v%d.%d (customer '%.16s') status %d max=%ux%u\n",
-		 app_info.version[0], app_info.version[1], app_info.customer_config_id,
-		 status, le16_to_cpu(app_info.max_x), le16_to_cpu(app_info.max_y));
+	if (got_app_info) {
+		dev_info(&tcm->client->dev,
+			 "Application firmware v%d.%d (customer '%.16s') status %d max=%ux%u\n",
+			 app_info.version[0], app_info.version[1],
+			 app_info.customer_config_id, status,
+			 le16_to_cpu(app_info.max_x), le16_to_cpu(app_info.max_y));
+		*max_x = le16_to_cpu(app_info.max_x);
+		*max_y = le16_to_cpu(app_info.max_y);
+		tcm->max_objects = clamp_t(u16, get_unaligned_le16(app_info.max_objects),
+					   1, TCM_MAX_OBJECTS);
+		cfg_max_len = get_unaligned_le16(app_info.max_touch_report_config_size);
+	} else {
+		*max_x = 0;
+		*max_y = 0;
+		tcm->max_objects = TCM_MAX_OBJECTS;
+		cfg_max_len = TCM_DEFAULT_REPORT_CONFIG_SIZE;
+	}
 
-	*max_x = le16_to_cpu(app_info.max_x);
-	*max_y = le16_to_cpu(app_info.max_y);
 	device_property_read_u32(&tcm->client->dev, "touchscreen-size-x", &dt_x);
 	device_property_read_u32(&tcm->client->dev, "touchscreen-size-y", &dt_y);
 	if (*max_x <= 1)
@@ -1178,8 +1237,6 @@ static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 		*max_y = dt_y ? dt_y : TCM_FALLBACK_MAX_Y;
 	tcm->max_x = *max_x;
 	tcm->max_y = *max_y;
-	tcm->max_objects = clamp_t(u16, get_unaligned_le16(app_info.max_objects),
-				   1, TCM_MAX_OBJECTS);
 
 	/*
 	 * Program the standard 12-bit normal touch report config (matching
@@ -1187,7 +1244,6 @@ static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 	 * is the 7-byte gesture header and payload[7..] starts Object 0,
 	 * ensuring consistent decoding and 0xa5 0x03 transient prefix stripping.
 	 */
-	cfg_max_len = get_unaligned_le16(app_info.max_touch_report_config_size);
 	if (cfg_max_len < TCM_DEFAULT_REPORT_CONFIG_SIZE)
 		cfg_max_len = TCM_DEFAULT_REPORT_CONFIG_SIZE;
 	cfg_max_len = clamp_t(u16, cfg_max_len, sizeof(tcm_normal_report_config),
@@ -1245,23 +1301,6 @@ static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 		dev_dbg(&tcm->client->dev, "DC_NO_DOZE not supported\n");
 	if (tcm_get_dynamic_config(tcm, DC_NOISE_LENGTH, &tcm->default_noise_length))
 		tcm->default_noise_length = 0;
-
-	return 0;
-}
-
-static int tcm_power_on(struct tcm_data *tcm)
-{
-	int ret;
-
-	ret = regulator_bulk_enable(ARRAY_SIZE(tcm->supplies),
-				    tcm->supplies);
-	if (ret)
-		return ret;
-
-	gpiod_set_value_cansleep(tcm->reset_gpio, 1);
-	usleep_range(10000, 11000);
-	gpiod_set_value_cansleep(tcm->reset_gpio, 0);
-	usleep_range(80000, 81000);
 
 	return 0;
 }
@@ -1426,6 +1465,14 @@ static void tcm_proc_cleanup(void *data)
 	if (READ_ONCE(g_tcm_data) == tcm)
 		WRITE_ONCE(g_tcm_data, NULL);
 	cancel_work_sync(&tcm->screen_work);
+	if (tcm->proc_gesture) {
+		proc_remove(tcm->proc_gesture);
+		tcm->proc_gesture = NULL;
+	}
+	if (tcm->proc_game) {
+		proc_remove(tcm->proc_game);
+		tcm->proc_game = NULL;
+	}
 	if (tcm->proc_dir) {
 		proc_remove(tcm->proc_dir);
 		tcm->proc_dir = NULL;
@@ -1464,23 +1511,38 @@ static int tcm_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
-	tcm->reset_gpio = devm_gpiod_get(&client->dev, "reset", GPIOD_OUT_LOW);
+	/* Hold controller in reset while enabling supplies and arming IRQ */
+	tcm->reset_gpio = devm_gpiod_get(&client->dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(tcm->reset_gpio))
+		return PTR_ERR(tcm->reset_gpio);
 
-	ret = devm_add_action_or_reset(&client->dev, tcm_power_off,
-				       tcm);
+	ret = regulator_bulk_enable(ARRAY_SIZE(tcm->supplies), tcm->supplies);
 	if (ret)
 		return ret;
 
-	ret = tcm_power_on(tcm);
+	ret = devm_add_action_or_reset(&client->dev, tcm_power_off, tcm);
 	if (ret)
 		return ret;
 
+	usleep_range(10000, 11000);
+
+	/*
+	 * Arm IRQ before releasing reset so we capture the controller's
+	 * automatic power-on REPORT_IDENTIFY (matching OPlus syna_tcm_reset).
+	 */
 	ret = devm_request_threaded_irq(&client->dev, client->irq, NULL,
 					tcm_report_irq,
 					IRQF_ONESHOT,
 					"synaptics_tcm_report", tcm);
 	if (ret < 0)
 		return ret;
+
+	reinit_completion(&tcm->response);
+	gpiod_set_value_cansleep(tcm->reset_gpio, 0);
+	if (!wait_for_completion_timeout(&tcm->response, msecs_to_jiffies(250))) {
+		/* Drain one pending boot packet in case ATTN was not asserted */
+		tcm_read_one_message(tcm);
+	}
 
 	ret = tcm_hw_init(tcm, &max_x, &max_y);
 	if (ret) {
@@ -1521,12 +1583,26 @@ static int tcm_probe(struct i2c_client *client)
 
 	device_init_wakeup(&client->dev, true);
 
-	tcm->proc_dir = proc_mkdir("touchpanel", NULL);
-	if (tcm->proc_dir) {
-		proc_create_data("double_tap_enable_indep", 0666, tcm->proc_dir,
-				 &tcm_proc_gesture_ops, tcm);
-		proc_create_data("game_switch_enable", 0666, tcm->proc_dir,
-				 &tcm_proc_game_ops, tcm);
+	/*
+	 * /proc/touchpanel may already be created by goodix_fp (fp_enable).
+	 * Try creating under the existing directory first to avoid duplicate
+	 * proc_mkdir() warnings, and only create the directory if absent.
+	 */
+	tcm->proc_gesture = proc_create_data("touchpanel/double_tap_enable_indep",
+					     0666, NULL, &tcm_proc_gesture_ops, tcm);
+	if (tcm->proc_gesture) {
+		tcm->proc_game = proc_create_data("touchpanel/game_switch_enable",
+						  0666, NULL, &tcm_proc_game_ops, tcm);
+	} else {
+		tcm->proc_dir = proc_mkdir("touchpanel", NULL);
+		if (tcm->proc_dir) {
+			tcm->proc_gesture = proc_create_data("double_tap_enable_indep",
+							     0666, tcm->proc_dir,
+							     &tcm_proc_gesture_ops, tcm);
+			tcm->proc_game = proc_create_data("game_switch_enable",
+							  0666, tcm->proc_dir,
+							  &tcm_proc_game_ops, tcm);
+		}
 	}
 
 	WRITE_ONCE(g_tcm_data, tcm);
