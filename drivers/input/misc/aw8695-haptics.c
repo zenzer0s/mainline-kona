@@ -11,13 +11,18 @@
 #include <linux/firmware.h>
 #include <linux/fs.h>
 #include <linux/gpio/consumer.h>
+#include <linux/hrtimer.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
 #include <linux/ktime.h>
+#include <linux/leds.h>
+#include <linux/math64.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/pm_qos.h>
+#include <linux/proc_fs.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -520,6 +525,21 @@
 #define RICHTAP_MMAP_PAGE_ORDER			2
 #define RICHTAP_MMAP_BUF_SUM			16
 #define RICHTAP_RTP_MAX_CHUNK			512
+#define AW8695_PM_QOS_LATENCY_US		400
+#define AW8695_OSC_CALI_FALLBACK_LEN		48000
+#define AW8695_RAM_FW_DELAY_MS			5000
+#define AW8695_VBAT_MIN_MV			3000
+#define AW8695_VBAT_MAX_MV			4500
+#define AW8695_HAPTIC_SEQ_SIZE			8
+#define AW8695_HAPTIC_LOOP_SIZE			8
+#define AW8695_HAPTIC_DEFAULT_GAIN		0x80
+#define AW8695_HAPTIC_DEFAULT_VMAX		0x11
+#define AW8695_HAPTIC_HIGH_VMAX_REG		0x16
+
+enum aw8695_vibration_style {
+	AW8695_VIBRATION_STYLE_CRISP = 0,
+	AW8695_VIBRATION_STYLE_SOFT = 1,
+};
 
 #pragma pack(4)
 struct mmap_buf_format {
@@ -538,6 +558,7 @@ static_assert(sizeof(struct mmap_buf_format) == 1024);
 enum aw8695_work_mode {
 	AW8695_STANDBY_MODE,
 	AW8695_RAM_MODE,
+	AW8695_RAM_LOOP_MODE,
 	AW8695_RTP_MODE,
 	AW8695_TRIG_MODE,
 	AW8695_CONT_MODE,
@@ -569,6 +590,36 @@ struct aw8695_data {
 	/* Calibrated resonant frequency (Hz * 10, e.g. 1700 = 170.0 Hz) */
 	u32 f0;
 	u8 f0_cali_lra;
+	/* 24 kHz oscillator drift calibration for RTP streaming */
+	u8 osc_cali_lra;
+	bool osc_calibrated;
+	s64 osc_microsecond;
+	/* SRAM waveform firmware cache */
+	u8 *ram_fw_data;
+	size_t ram_fw_len;
+	u16 ram_base_addr;
+	u16 ram_checksum;
+	bool ram_fw_loaded;
+	u8 vibration_style;
+	struct delayed_work ram_work;
+	/* Legacy /sys/class/leds/vibrator and /proc/vibrator/touch_style */
+	struct led_classdev cdev;
+	struct hrtimer vibrator_timer;
+	struct work_struct vibrator_work;
+	struct proc_dir_entry *proc_dir;
+	struct proc_dir_entry *proc_touch_style;
+	u8 seq[AW8695_HAPTIC_SEQ_SIZE];
+	u8 loop[AW8695_HAPTIC_LOOP_SIZE];
+	u8 gain;
+	u8 vmax;
+	u32 duration;
+	u32 state;
+	u32 vbat;
+	u32 lra_resistance;
+	/* CPU latency PM QoS for jitter-free RTP FIFO pacing */
+	struct pm_qos_request pm_qos_req;
+	struct mutex qos_lock;
+	bool pm_qos_added;
 	/* AAC RichTap /dev/awinic_haptic streaming state */
 	struct mutex ioctl_lock;
 	struct miscdevice miscdev;
@@ -671,6 +722,26 @@ static int aw8695_set_work_mode(struct aw8695_data *haptics,
 			return err;
 		break;
 	case AW8695_RAM_MODE:
+		err = regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+			AW8695_SYSCTRL_PLAY_MODE_MASK, AW8695_SYSCTRL_PLAY_MODE_RAM);
+		if (err)
+			return err;
+		err = regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+			AW8695_SYSCTRL_BST_MODE_MASK, AW8695_SYSCTRL_BST_MODE_BYPASS);
+		if (err)
+			return err;
+		err = aw8695_haptic_set_active(haptics);
+		if (err)
+			return err;
+		if (haptics->chipid == AW8697_CHIPID) {
+			err = regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+				AW8695_SYSCTRL_BST_MODE_MASK, AW8695_SYSCTRL_BST_MODE_BOOST);
+			if (err)
+				return err;
+			usleep_range(2000, 2500);
+		}
+		break;
+	case AW8695_RAM_LOOP_MODE:
 		err = regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
 			AW8695_SYSCTRL_PLAY_MODE_MASK, AW8695_SYSCTRL_PLAY_MODE_RAM);
 		if (err)
@@ -886,8 +957,8 @@ static int aw8695_haptics_start(struct aw8695_data *haptics)
 	if (err)
 		return err;
 
-	/* Configure for RAM mode */
-	err = aw8695_set_work_mode(haptics, AW8695_RAM_MODE);
+	/* Configure for RAM loop mode */
+	err = aw8695_set_work_mode(haptics, AW8695_RAM_LOOP_MODE);
 	if (err)
 		return err;
 
@@ -1348,11 +1419,120 @@ static int aw8695_init(struct aw8695_data *haptics)
 			FIELD_GET(AW8695_LOW_MASK, haptics->bemf_vthl));
 }
 
+static int aw8695_write_ram_data(struct aw8695_data *haptics,
+				 const u8 *buf, size_t len)
+{
+	size_t off = 0;
+
+	while (off < len) {
+		size_t chunk = min_t(size_t, len - off, RICHTAP_RTP_MAX_CHUNK);
+		int ret;
+
+		haptics->rtp_tx_buf[0] = AW8695_RAMDATA;
+		memcpy(&haptics->rtp_tx_buf[1], buf + off, chunk);
+		ret = i2c_master_send(haptics->client, haptics->rtp_tx_buf, chunk + 1);
+		if (ret < 0)
+			return ret;
+		off += chunk;
+	}
+	return 0;
+}
+
+static int aw8695_ram_load_container(struct aw8695_data *haptics,
+				     const u8 *data, size_t len)
+{
+	struct device *dev = &haptics->client->dev;
+	u16 expected_csum, calc_csum = 0;
+	u16 base_addr, fifo_ae, fifo_af;
+	size_t i;
+	int err;
+
+	if (len <= 4)
+		return -EINVAL;
+
+	expected_csum = ((u16)data[0] << 8) | data[1];
+	for (i = 2; i < len; i++)
+		calc_csum += data[i];
+	if (calc_csum != expected_csum) {
+		dev_err(dev, "SRAM firmware checksum mismatch: calc=0x%04x expected=0x%04x\n",
+			calc_csum, expected_csum);
+		return -EINVAL;
+	}
+
+	base_addr = ((u16)data[2] << 8) | data[3];
+	if (base_addr < 0x400 || base_addr > 0x1000) {
+		dev_err(dev, "Invalid SRAM firmware base_addr=0x%04x\n", base_addr);
+		return -EINVAL;
+	}
+
+	fifo_ae = base_addr >> 1;
+	fifo_af = base_addr - (base_addr >> 2);
+
+	err = regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+		AW8695_SYSCTRL_RAMINIT_EN, AW8695_SYSCTRL_RAMINIT_EN);
+	if (err)
+		return err;
+
+	err = regmap_write(haptics->regmap, AW8695_BASE_ADDRH,
+		FIELD_GET(AW8695_HIGH_MASK, base_addr));
+	if (err)
+		goto out_disable;
+	err = regmap_write(haptics->regmap, AW8695_BASE_ADDRL,
+		FIELD_GET(AW8695_LOW_MASK, base_addr));
+	if (err)
+		goto out_disable;
+	err = regmap_write(haptics->regmap, AW8695_FIFO_AEH,
+		FIELD_GET(AW8695_HIGH_MASK, fifo_ae));
+	if (err)
+		goto out_disable;
+	err = regmap_write(haptics->regmap, AW8695_FIFO_AEL,
+		FIELD_GET(AW8695_LOW_MASK, fifo_ae));
+	if (err)
+		goto out_disable;
+	err = regmap_write(haptics->regmap, AW8695_FIFO_AFH,
+		FIELD_GET(AW8695_HIGH_MASK, fifo_af));
+	if (err)
+		goto out_disable;
+	err = regmap_write(haptics->regmap, AW8695_FIFO_AFL,
+		FIELD_GET(AW8695_LOW_MASK, fifo_af));
+	if (err)
+		goto out_disable;
+
+	err = regmap_write(haptics->regmap, AW8695_RAMADDRH,
+		FIELD_GET(AW8695_HIGH_MASK, base_addr));
+	if (err)
+		goto out_disable;
+	err = regmap_write(haptics->regmap, AW8695_RAMADDRL,
+		FIELD_GET(AW8695_LOW_MASK, base_addr));
+	if (err)
+		goto out_disable;
+
+	err = aw8695_write_ram_data(haptics, data + 4, len - 4);
+	if (err)
+		goto out_disable;
+
+	haptics->ram_base_addr = base_addr;
+	haptics->ram_checksum = calc_csum;
+	haptics->ram_fw_loaded = true;
+
+out_disable:
+	regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+		AW8695_SYSCTRL_RAMINIT_EN, 0);
+	return err;
+}
+
 static int aw8695_ram_init(struct aw8695_data *haptics)
 {
 	unsigned char *ptr;
 	int err;
 	int i;
+
+	if (haptics->ram_fw_data && haptics->ram_fw_len > 4) {
+		err = aw8695_ram_load_container(haptics, haptics->ram_fw_data,
+						haptics->ram_fw_len);
+		if (!err)
+			return 0;
+	}
 
 	/* Enable SRAM init */
 	err = regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
@@ -1412,6 +1592,8 @@ static int aw8695_ram_init(struct aw8695_data *haptics)
 		if (err)
 			return err;
 	}
+
+	haptics->ram_base_addr = AW8695_RAM_BASE_ADDR;
 
 	/* Disable SRAM init */
 	return regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
@@ -1475,12 +1657,30 @@ static irqreturn_t aw8695_irq(int irq, void *data)
  * AAC RichTap (/dev/awinic_haptic) RTP FIFO Streaming & IOCTL Interface
  * ========================================================================= */
 
+static int aw8695_ram_update(struct aw8695_data *haptics);
+
+static void aw8695_pm_qos_enable(struct aw8695_data *haptics, bool enable)
+{
+	mutex_lock(&haptics->qos_lock);
+	if (haptics->pm_qos_added) {
+		cpu_latency_qos_update_request(&haptics->pm_qos_req,
+					       enable ? AW8695_PM_QOS_LATENCY_US
+						      : PM_QOS_DEFAULT_VALUE);
+	}
+	mutex_unlock(&haptics->qos_lock);
+}
+
 static int aw8695_haptic_set_bst_vol(struct aw8695_data *haptics, u8 bst_vol)
 {
 	if (bst_vol & 0xe0)
 		bst_vol = 0x1f;
 	return regmap_update_bits(haptics->regmap, AW8695_BSTDBG4,
 				  AW8695_BSTDBG4_BSTVOL_MASK, bst_vol << 1);
+}
+
+static int aw8695_haptic_set_gain(struct aw8695_data *haptics, u8 gain)
+{
+	return regmap_write(haptics->regmap, AW8695_DATDBG, gain);
 }
 
 static int aw8695_haptic_set_rtp_aei(struct aw8695_data *haptics, bool enable)
@@ -1495,10 +1695,18 @@ static int aw8695_richtap_set_osc_clock(struct aw8695_data *haptics, bool rtp_os
 	/*
 	 * aw8695_haptic_get_f0() switches ANACTRL.LRA_SRC to REG for f0-calibrated
 	 * RAM playback. For 24 kHz RichTap RTP waveforms (already f0-resampled by
-	 * libaacvibrator.so), restore the factory eFuse 24 MHz oscillator trim so
+	 * libaacvibrator.so), use the OSC-drift calibrated TRIM_LRA if available,
+	 * otherwise fall back to the factory eFuse 24 MHz oscillator trim so
 	 * waveforms stay dead-on the LRA's high-Q resonant frequency.
 	 */
 	if (rtp_osc) {
+		if (haptics->osc_calibrated) {
+			regmap_update_bits(haptics->regmap, AW8695_ANACTRL,
+					   AW8695_ANACTRL_LRA_SRC_MASK,
+					   AW8695_ANACTRL_LRA_SRC_REG);
+			return regmap_write(haptics->regmap, AW8695_TRIM_LRA,
+					    haptics->osc_cali_lra);
+		}
 		return regmap_update_bits(haptics->regmap, AW8695_ANACTRL,
 					  AW8695_ANACTRL_LRA_SRC_MASK,
 					  AW8695_ANACTRL_LRA_SRC_EFUSE);
@@ -1529,15 +1737,17 @@ static int aw8695_rtp_write(struct aw8695_data *haptics, const u8 *buf, size_t l
 
 static int aw8695_rtp_write_fifo(struct aw8695_data *haptics, const u8 *buf, size_t len)
 {
+	size_t base_addr = haptics->ram_base_addr ? haptics->ram_base_addr
+						  : AW8695_RAM_BASE_ADDR;
 	size_t off = 0;
 	ktime_t t_start;
 
-	/* Payloads <= 2 KB fit directly in the AW8697 hardware RTP FIFO */
-	if (len <= AW8695_RAM_BASE_ADDR)
+	/* Payloads <= FIFO size fit directly in the AW8697 hardware RTP FIFO */
+	if (len <= base_addr)
 		return aw8695_rtp_write(haptics, buf, len);
 
-	/* Larger payloads: prefill 1.5 KB then pace on FIFO almost-full status */
-	off = min_t(size_t, len, AW8695_RAM_BASE_ADDR - (AW8695_RAM_BASE_ADDR >> 2));
+	/* Larger payloads: prefill 75% then pace on FIFO almost-full status */
+	off = min_t(size_t, len, base_addr - (base_addr >> 2));
 	if (aw8695_rtp_write(haptics, buf, off) < 0)
 		return -EIO;
 
@@ -1566,6 +1776,209 @@ static int aw8695_rtp_write_fifo(struct aw8695_data *haptics, const u8 *buf, siz
 		t_start = ktime_get();
 	}
 	return 0;
+}
+
+static int aw8695_osc_trim_calc(struct aw8695_data *haptics, u64 theory_us,
+				u64 real_us, u8 *trim_out)
+{
+	struct device *dev = &haptics->client->dev;
+	u64 diff;
+	u32 real_code, lra_trim;
+
+	if (!theory_us || theory_us == real_us) {
+		*trim_out = 0;
+		return 1;
+	}
+
+	diff = (real_us > theory_us) ? (real_us - theory_us)
+				     : (theory_us - real_us);
+	if (diff > div_u64(theory_us, 50)) {
+		dev_warn(dev, "OSC drift out of range (>2%%): real=%llu us theory=%llu us\n",
+			 real_us, theory_us);
+		return -ERANGE;
+	}
+	if (diff < div_u64(theory_us * 10, 10000)) {
+		dev_info(dev, "OSC within 0.1%% (%llu vs %llu us), no trim needed\n",
+			 real_us, theory_us);
+		*trim_out = 0;
+		return 1;
+	}
+
+	real_code = (u32)div64_u64(diff * 4000ULL, theory_us);
+	real_code = ((real_code % 10 < 5) ? 0 : 1) + real_code / 10;
+	if (real_us > theory_us)
+		real_code = 32 + real_code;
+	else
+		real_code = 32 - real_code;
+
+	if (real_code > 31)
+		lra_trim = real_code - 32;
+	else
+		lra_trim = real_code + 32;
+
+	*trim_out = (u8)(lra_trim & 0x3f);
+	dev_info(dev, "OSC cali: real=%llu us theory=%llu us trim=0x%02x\n",
+		 real_us, theory_us, *trim_out);
+	return 0;
+}
+
+static int aw8695_rtp_osc_calibration(struct aw8695_data *haptics, bool compute_trim)
+{
+	struct device *dev = &haptics->client->dev;
+	const struct firmware *fw = NULL;
+	u8 *fallback_buf = NULL;
+	const u8 *data;
+	size_t data_len, rtp_cnt = 0;
+	size_t chunk_max;
+	unsigned int pwmdbg = 0, sysst = 0, dbgstat = 0;
+	u32 pwm_hz;
+	u64 theory_us;
+	ktime_t t_start = 0, t_end, t_loop_start;
+	bool started_ts = false;
+	int ret = 0;
+
+	/* Prefer stock aw8697_rtp.bin if present; otherwise stream silent 24 kHz buffer */
+	if (firmware_request_nowarn(&fw, "aw8697_rtp.bin", dev) == 0 && fw && fw->size > 0) {
+		data = fw->data;
+		data_len = fw->size;
+	} else {
+		if (fw) {
+			release_firmware(fw);
+			fw = NULL;
+		}
+		fallback_buf = kvzalloc(AW8695_OSC_CALI_FALLBACK_LEN, GFP_KERNEL);
+		if (!fallback_buf)
+			return -ENOMEM;
+		data = fallback_buf;
+		data_len = AW8695_OSC_CALI_FALLBACK_LEN;
+	}
+
+	mutex_lock(&haptics->ioctl_lock);
+	atomic_set(&haptics->done_flag, 1);
+	if (haptics->start_buf) {
+		int i;
+
+		for (i = 0; i < RICHTAP_MMAP_BUF_SUM; i++)
+			haptics->start_buf[i].status = MMAP_BUF_DATA_FINISHED;
+		smp_mb();
+	}
+	if (haptics->rtp_wq)
+		cancel_work_sync(&haptics->haptic_rtp_work);
+
+	mutex_lock(&haptics->lock);
+	aw8695_haptic_set_rtp_aei(haptics, false);
+	aw8695_haptics_stop(haptics);
+
+	regmap_update_bits(haptics->regmap, AW8695_ANACTRL,
+			   AW8695_ANACTRL_LRA_SRC_MASK,
+			   AW8695_ANACTRL_LRA_SRC_REG);
+	if (compute_trim)
+		regmap_write(haptics->regmap, AW8695_TRIM_LRA, 0x00);
+	else
+		regmap_write(haptics->regmap, AW8695_TRIM_LRA, haptics->osc_cali_lra);
+
+	aw8695_haptic_set_gain(haptics, haptics->gain);
+	haptics->haptic_rtp_mode = true;
+	aw8695_set_work_mode(haptics, AW8695_RTP_MODE);
+	regmap_update_bits(haptics->regmap, AW8695_DBGCTRL,
+			   AW8695_DBGCTRL_INT_MODE_MASK,
+			   AW8695_DBGCTRL_INT_MODE_EDGE);
+	aw8695_interrupt_clear(haptics);
+	regmap_update_bits(haptics->regmap, AW8695_GO,
+			   AW8695_GO_ENABLE, AW8695_GO_ENABLE);
+
+	chunk_max = haptics->ram_base_addr ? (haptics->ram_base_addr >> 2)
+					   : (AW8695_RAM_BASE_ADDR >> 2);
+	if (chunk_max > RICHTAP_RTP_MAX_CHUNK)
+		chunk_max = RICHTAP_RTP_MAX_CHUNK;
+
+	aw8695_pm_qos_enable(haptics, true);
+	t_loop_start = ktime_get();
+
+	while (1) {
+		if (rtp_cnt < data_len) {
+			ret = regmap_read(haptics->regmap, AW8695_SYSST, &sysst);
+			if (ret)
+				break;
+			if (!(sysst & AW8695_SYSST_FF_AFS)) {
+				size_t buf_len = min_t(size_t, data_len - rtp_cnt, chunk_max);
+
+				if (!started_ts) {
+					t_start = ktime_get();
+					started_ts = true;
+				}
+				ret = aw8695_rtp_write(haptics, data + rtp_cnt, buf_len);
+				if (ret)
+					break;
+				rtp_cnt += buf_len;
+			}
+		}
+
+		ret = regmap_read(haptics->regmap, AW8695_DBGSTAT, &dbgstat);
+		if (ret)
+			break;
+		if (started_ts && rtp_cnt >= data_len &&
+		    (dbgstat & AW8695_DBGSTAT_FF_EMPTY)) {
+			t_end = ktime_get();
+			haptics->osc_microsecond = ktime_us_delta(t_end, t_start);
+			break;
+		}
+
+		t_end = ktime_get();
+		if (started_ts) {
+			haptics->osc_microsecond = ktime_us_delta(t_end, t_start);
+			if (haptics->osc_microsecond > 6000000) {
+				dev_warn(dev, "OSC cali timed out at %zu/%zu bytes\n",
+					 rtp_cnt, data_len);
+				ret = -ETIMEDOUT;
+				break;
+			}
+		} else if (ktime_us_delta(t_end, t_loop_start) > 500000) {
+			dev_warn(dev, "OSC cali FIFO never ready\n");
+			ret = -ETIMEDOUT;
+			break;
+		}
+	}
+
+	aw8695_pm_qos_enable(haptics, false);
+	aw8695_haptics_stop(haptics);
+	haptics->haptic_rtp_mode = false;
+
+	if (!ret && started_ts && compute_trim) {
+		u8 trim = 0;
+		int calc_ret;
+
+		regmap_read(haptics->regmap, AW8695_PWMDBG, &pwmdbg);
+		switch ((pwmdbg & AW8695_PWMDBG_PWM_MODE_MASK) >> 5) {
+		case 3:
+			pwm_hz = 12000;
+			break;
+		case 2:
+			pwm_hz = 24000;
+			break;
+		default:
+			pwm_hz = 48000;
+			break;
+		}
+		theory_us = div_u64((u64)data_len * 1000000ULL, pwm_hz);
+		calc_ret = aw8695_osc_trim_calc(haptics, theory_us,
+						(u64)haptics->osc_microsecond, &trim);
+		if (calc_ret >= 0) {
+			haptics->osc_cali_lra = trim;
+			haptics->osc_calibrated = (calc_ret == 0);
+		} else {
+			ret = calc_ret;
+		}
+	}
+
+	aw8695_richtap_set_osc_clock(haptics, false);
+	mutex_unlock(&haptics->lock);
+	mutex_unlock(&haptics->ioctl_lock);
+
+	kvfree(fallback_buf);
+	if (fw)
+		release_firmware(fw);
+	return ret;
 }
 
 static void aw8695_richtap_clean_buf(struct aw8695_data *haptics, u8 status)
@@ -1620,6 +2033,7 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 		return;
 	}
 
+	aw8695_pm_qos_enable(haptics, true);
 	t_start = ktime_get();
 	while (!atomic_read(&haptics->done_flag)) {
 		if (ktime_us_delta(ktime_get(), t_start) > 800000) {
@@ -1660,12 +2074,14 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 		}
 	}
 
+	aw8695_pm_qos_enable(haptics, false);
+
 	mutex_lock(&haptics->lock);
 	aw8695_haptic_set_rtp_aei(haptics, false);
-	if (timed_out || atomic_read(&haptics->done_flag))
+	if (timed_out || atomic_read(&haptics->done_flag)) {
 		aw8695_haptics_stop(haptics);
-	if (haptics->input_dev)
 		aw8695_richtap_set_osc_clock(haptics, false);
+	}
 	haptics->haptic_rtp_mode = false;
 	mutex_unlock(&haptics->lock);
 }
@@ -1716,9 +2132,13 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 		if (arg > 0x80)
 			arg = 0x80;
 		mutex_lock(&haptics->lock);
+		haptics->gain = (u8)arg;
 		ret = regmap_write(haptics->regmap, AW8695_DATDBG, (u8)arg);
 		mutex_unlock(&haptics->lock);
 		return ret;
+
+	case RICHTAP_UPDATE_RAM:
+		return aw8695_ram_update(haptics);
 
 	case RICHTAP_RTP_MODE:
 		mutex_lock(&haptics->ioctl_lock);
@@ -1743,13 +2163,19 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 			mutex_unlock(&haptics->ioctl_lock);
 			return -EINVAL;
 		}
+		haptics->haptic_rtp_mode = true;
 		aw8695_haptic_set_bst_vol(haptics, 0x11);
 		aw8695_richtap_set_osc_clock(haptics, true);
 		aw8695_set_work_mode(haptics, AW8695_RTP_MODE);
 		regmap_update_bits(haptics->regmap, AW8695_GO,
 				   AW8695_GO_ENABLE, AW8695_GO_ENABLE);
 		usleep_range(2000, 2500);
+		if (tmp > (haptics->ram_base_addr ? haptics->ram_base_addr
+						  : AW8695_RAM_BASE_ADDR))
+			aw8695_pm_qos_enable(haptics, true);
 		ret = aw8695_rtp_write_fifo(haptics, &haptics->rtp_ptr[4], tmp);
+		aw8695_pm_qos_enable(haptics, false);
+		haptics->haptic_rtp_mode = false;
 		mutex_unlock(&haptics->lock);
 		mutex_unlock(&haptics->ioctl_lock);
 		return ret;
@@ -1780,8 +2206,7 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 		mutex_lock(&haptics->lock);
 		aw8695_haptic_set_rtp_aei(haptics, false);
 		aw8695_haptics_stop(haptics);
-		if (haptics->input_dev)
-			aw8695_richtap_set_osc_clock(haptics, false);
+		aw8695_richtap_set_osc_clock(haptics, false);
 		haptics->haptic_rtp_mode = false;
 		mutex_unlock(&haptics->lock);
 		mutex_unlock(&haptics->ioctl_lock);
@@ -1831,6 +2256,12 @@ static void aw8695_richtap_cleanup(void *data)
 		cancel_work_sync(&haptics->haptic_rtp_work);
 		destroy_workqueue(haptics->rtp_wq);
 	}
+	mutex_lock(&haptics->qos_lock);
+	if (haptics->pm_qos_added) {
+		cpu_latency_qos_remove_request(&haptics->pm_qos_req);
+		haptics->pm_qos_added = false;
+	}
+	mutex_unlock(&haptics->qos_lock);
 	if (haptics->start_buf) {
 		struct page *base = virt_to_page(haptics->start_buf);
 
@@ -1879,6 +2310,9 @@ static int aw8695_richtap_init(struct aw8695_data *haptics)
 		return -ENOMEM;
 	}
 
+	cpu_latency_qos_add_request(&haptics->pm_qos_req, PM_QOS_DEFAULT_VALUE);
+	haptics->pm_qos_added = true;
+
 	INIT_WORK(&haptics->haptic_rtp_work, aw8695_richtap_rtp_work);
 	atomic_set(&haptics->done_flag, 1);
 	haptics->haptic_rtp_mode = false;
@@ -1900,6 +2334,867 @@ static int aw8695_richtap_init(struct aw8695_data *haptics)
 
 	dev_info(dev, "Registered RichTap /dev/awinic_haptic (f0=%u)\n",
 		 haptics->f0);
+	return 0;
+}
+
+/* =========================================================================
+ * AW8697 SRAM Waveform Firmware Loader, Legacy /sys/class/leds/vibrator
+ * and /proc/vibrator/touch_style
+ * ========================================================================= */
+
+static const char *aw8695_select_ram_fw_name(struct aw8695_data *haptics)
+{
+	u32 f0_hz = (haptics->f0 ? haptics->f0 : haptics->f0_preset) / 10;
+
+	if (f0_hz < 167)
+		return "aw8697_haptic_166.bin";
+	if (f0_hz < 169)
+		return "aw8697_haptic_168.bin";
+	if (f0_hz < 171)
+		return "aw8697_haptic_170.bin";
+	if (f0_hz < 173)
+		return "aw8697_haptic_172.bin";
+	return "aw8697_haptic_174.bin";
+}
+
+static void aw8695_ram_loaded(const struct firmware *fw, void *context)
+{
+	struct aw8695_data *haptics = context;
+	struct device *dev = &haptics->client->dev;
+	size_t fw_len;
+	u8 *copy;
+	int err;
+
+	if (!fw) {
+		dev_dbg(dev, "No AW8697 SRAM firmware found, keeping built-in waveform\n");
+		return;
+	}
+
+	fw_len = fw->size;
+	if (fw_len <= 4) {
+		dev_err(dev, "AW8697 SRAM firmware too small (%zu bytes)\n", fw_len);
+		release_firmware(fw);
+		return;
+	}
+
+	copy = kvmalloc(fw_len, GFP_KERNEL);
+	if (!copy) {
+		release_firmware(fw);
+		return;
+	}
+	memcpy(copy, fw->data, fw_len);
+	release_firmware(fw);
+
+	mutex_lock(&haptics->lock);
+	if (haptics->haptic_rtp_mode) {
+		mutex_unlock(&haptics->lock);
+		kvfree(copy);
+		dev_info(dev, "Deferring SRAM firmware load while RTP is active\n");
+		return;
+	}
+
+	aw8695_haptics_stop(haptics);
+	err = aw8695_ram_load_container(haptics, copy, fw_len);
+	if (!err) {
+		kvfree(haptics->ram_fw_data);
+		haptics->ram_fw_data = copy;
+		haptics->ram_fw_len = fw_len;
+		dev_info(dev, "Loaded AW8697 SRAM firmware (%zu bytes, base=0x%04x, csum=0x%04x)\n",
+			 haptics->ram_fw_len, haptics->ram_base_addr,
+			 haptics->ram_checksum);
+	} else {
+		kvfree(copy);
+		dev_err(dev, "Failed to load AW8697 SRAM firmware: %d\n", err);
+	}
+	mutex_unlock(&haptics->lock);
+}
+
+static int aw8695_ram_update(struct aw8695_data *haptics)
+{
+	const char *fw_name = aw8695_select_ram_fw_name(haptics);
+	struct device *dev = &haptics->client->dev;
+	int err;
+
+	err = request_firmware_nowait(THIS_MODULE, FW_ACTION_UEVENT, fw_name,
+				      dev, GFP_KERNEL, haptics,
+				      aw8695_ram_loaded);
+	if (err)
+		dev_warn(dev, "request_firmware_nowait(%s) failed: %d\n",
+			 fw_name, err);
+	return err;
+}
+
+static void aw8695_ram_work_routine(struct work_struct *work)
+{
+	struct aw8695_data *haptics =
+		container_of(work, struct aw8695_data, ram_work.work);
+
+	aw8695_ram_update(haptics);
+}
+
+struct aw8695_vmax_map {
+	u32 level;
+	u8 vmax;
+	u8 gain;
+};
+
+static const struct aw8695_vmax_map aw8695_vmax_table[] = {
+	{ 800,  0x00, 0x30 }, { 900,  0x00, 0x36 }, { 1000, 0x00, 0x42 },
+	{ 1100, 0x00, 0x48 }, { 1200, 0x00, 0x54 }, { 1300, 0x00, 0x60 },
+	{ 1400, 0x00, 0x64 }, { 1500, 0x00, 0x70 }, { 1600, 0x00, 0x75 },
+	{ 1700, 0x02, 0x75 }, { 1800, 0x04, 0x75 }, { 1900, 0x06, 0x75 },
+	{ 2000, 0x08, 0x75 }, { 2100, 0x10, 0x75 }, { 2200, 0x12, 0x75 },
+	{ 2300, 0x14, 0x75 }, { 2400, 0x16, 0x75 },
+};
+
+static void aw8695_convert_level_to_vmax(struct aw8695_data *haptics, u32 val)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(aw8695_vmax_table); i++) {
+		if (val <= aw8695_vmax_table[i].level) {
+			haptics->vmax = aw8695_vmax_table[i].vmax;
+			haptics->gain = aw8695_vmax_table[i].gain;
+			return;
+		}
+	}
+	haptics->vmax = AW8695_HAPTIC_HIGH_VMAX_REG;
+	haptics->gain = 0x75;
+}
+
+static int aw8695_haptic_set_wav_seq(struct aw8695_data *haptics, u8 idx, u8 wav)
+{
+	if (idx >= AW8695_HAPTIC_SEQ_SIZE)
+		return -EINVAL;
+	haptics->seq[idx] = wav;
+	return regmap_write(haptics->regmap, AW8695_WAVSEQ1 + idx, wav);
+}
+
+static int aw8695_haptic_set_wav_loop(struct aw8695_data *haptics, u8 idx, u8 loop)
+{
+	unsigned int reg, mask, val;
+
+	if (idx >= AW8695_HAPTIC_LOOP_SIZE)
+		return -EINVAL;
+	haptics->loop[idx] = loop & 0x0f;
+	reg = AW8695_WAVLOOP1 + (idx / 2);
+	if ((idx % 2) == 0) {
+		mask = AW8695_WAVLOOP1_SEQ1_MASK;
+		val = (loop & 0x0f) << 4;
+	} else {
+		mask = AW8695_WAVLOOP1_SEQ2_MASK;
+		val = loop & 0x0f;
+	}
+	return regmap_update_bits(haptics->regmap, reg, mask, val);
+}
+
+static int aw8695_haptic_get_vbat(struct aw8695_data *haptics)
+{
+	unsigned int detctrl = 0, vbat_reg = 0;
+	u32 vbat_mv;
+	int err;
+
+	err = regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+				 AW8695_SYSCTRL_RAMINIT_EN,
+				 AW8695_SYSCTRL_RAMINIT_EN);
+	if (err)
+		return err;
+
+	err = regmap_update_bits(haptics->regmap, AW8695_DETCTRL,
+				 AW8695_DETCTRL_VBAT_GO_ENABLE,
+				 AW8695_DETCTRL_VBAT_GO_ENABLE);
+	if (err)
+		goto out_disable;
+
+	regmap_read_poll_timeout(haptics->regmap, AW8695_DETCTRL, detctrl,
+				 (detctrl & AW8695_DETCTRL_VBAT_GO_ENABLE) == 0,
+				 500, 10000);
+
+	err = regmap_read(haptics->regmap, AW8695_VBATDET, &vbat_reg);
+	if (!err) {
+		vbat_mv = (6100 * vbat_reg) / 256;
+		haptics->vbat = clamp_t(u32, vbat_mv, AW8695_VBAT_MIN_MV,
+					AW8695_VBAT_MAX_MV);
+	}
+
+out_disable:
+	regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+			   AW8695_SYSCTRL_RAMINIT_EN, 0);
+	return err;
+}
+
+static int aw8695_haptic_get_lra_resistance(struct aw8695_data *haptics)
+{
+	unsigned int rldet = 0;
+	int err;
+
+	aw8695_haptics_stop(haptics);
+	err = regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+				 AW8695_SYSCTRL_RAMINIT_EN,
+				 AW8695_SYSCTRL_RAMINIT_EN);
+	if (err)
+		return err;
+	regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+			   AW8695_SYSCTRL_BST_MODE_MASK,
+			   AW8695_SYSCTRL_BST_MODE_BYPASS);
+	regmap_update_bits(haptics->regmap, AW8695_ANACTRL,
+			   AW8695_ANACTRL_HD_PD_MASK, AW8695_ANACTRL_HD_HZ_EN);
+	regmap_update_bits(haptics->regmap, AW8695_D2SCFG,
+			   AW8695_D2SCFG_CLK_ADC_MASK,
+			   AW8695_D2SCFG_CLK_ASC_1P5MHZ);
+	regmap_update_bits(haptics->regmap, AW8695_DETCTRL,
+			   AW8695_DETCTRL_RL_OS_MASK, AW8695_DETCTRL_RL_DETECT);
+	regmap_update_bits(haptics->regmap, AW8695_DETCTRL,
+			   AW8695_DETCTRL_DIAG_GO_ENABLE,
+			   AW8695_DETCTRL_DIAG_GO_ENABLE);
+	usleep_range(3000, 3500);
+
+	err = regmap_read(haptics->regmap, AW8695_RLDET, &rldet);
+	if (!err)
+		haptics->lra_resistance = 298 * rldet;
+
+	regmap_update_bits(haptics->regmap, AW8695_ANACTRL,
+			   AW8695_ANACTRL_HD_PD_MASK, AW8695_ANACTRL_HD_PD_EN);
+	regmap_update_bits(haptics->regmap, AW8695_D2SCFG,
+			   AW8695_D2SCFG_CLK_ADC_MASK,
+			   AW8695_D2SCFG_CLK_ASC_6MHZ);
+	regmap_update_bits(haptics->regmap, AW8695_SYSCTRL,
+			   AW8695_SYSCTRL_RAMINIT_EN, 0);
+	return err;
+}
+
+static enum hrtimer_restart aw8695_vibrator_timer_func(struct hrtimer *timer)
+{
+	struct aw8695_data *haptics =
+		container_of(timer, struct aw8695_data, vibrator_timer);
+
+	haptics->state = 0;
+	schedule_work(&haptics->vibrator_work);
+	return HRTIMER_NORESTART;
+}
+
+static void aw8695_vibrator_work_routine(struct work_struct *work)
+{
+	struct aw8695_data *haptics =
+		container_of(work, struct aw8695_data, vibrator_work);
+	u8 wav;
+
+	mutex_lock(&haptics->lock);
+	if (haptics->haptic_rtp_mode) {
+		mutex_unlock(&haptics->lock);
+		return;
+	}
+
+	aw8695_haptics_stop(haptics);
+	if (haptics->state && haptics->duration > 0) {
+		wav = haptics->seq[0] ? haptics->seq[0] : 1;
+		aw8695_richtap_set_osc_clock(haptics, false);
+		aw8695_haptic_set_gain(haptics, haptics->gain);
+		aw8695_haptic_set_bst_vol(haptics, haptics->vmax);
+		aw8695_haptic_set_wav_seq(haptics, 0, wav);
+		aw8695_haptic_set_wav_seq(haptics, 1, 0);
+		aw8695_haptic_set_wav_loop(haptics, 0, 0x0f);
+		aw8695_set_work_mode(haptics, AW8695_RAM_LOOP_MODE);
+		regmap_update_bits(haptics->regmap, AW8695_GO,
+				   AW8695_GO_ENABLE, AW8695_GO_ENABLE);
+		hrtimer_start(&haptics->vibrator_timer,
+			      ms_to_ktime(haptics->duration),
+			      HRTIMER_MODE_REL);
+	}
+	mutex_unlock(&haptics->lock);
+}
+
+static int aw8695_haptic_brightness_set(struct led_classdev *cdev,
+					enum led_brightness level)
+{
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	int err = 0;
+
+	mutex_lock(&haptics->lock);
+	if (haptics->haptic_rtp_mode) {
+		mutex_unlock(&haptics->lock);
+		return 0;
+	}
+
+	aw8695_haptics_stop(haptics);
+	if (level > 0) {
+		if (!haptics->seq[0])
+			aw8695_haptic_set_wav_seq(haptics, 0, 1);
+		aw8695_richtap_set_osc_clock(haptics, false);
+		aw8695_haptic_set_gain(haptics, haptics->gain);
+		aw8695_haptic_set_bst_vol(haptics, haptics->vmax);
+		err = aw8695_set_work_mode(haptics, AW8695_RAM_MODE);
+		if (!err)
+			err = regmap_update_bits(haptics->regmap, AW8695_GO,
+						 AW8695_GO_ENABLE,
+						 AW8695_GO_ENABLE);
+	}
+	mutex_unlock(&haptics->lock);
+	return err;
+}
+
+static ssize_t state_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "%u\n", haptics->state);
+}
+
+static ssize_t state_store(struct device *dev, struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	haptics->state = val ? 1 : 0;
+	return count;
+}
+
+static ssize_t duration_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	ktime_t remaining;
+
+	if (hrtimer_active(&haptics->vibrator_timer)) {
+		remaining = hrtimer_get_remaining(&haptics->vibrator_timer);
+		return sysfs_emit(buf, "%lld\n", ktime_to_ms(remaining));
+	}
+	return sysfs_emit(buf, "%u\n", haptics->duration);
+}
+
+static ssize_t duration_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	haptics->duration = min_t(u32, val, 10000);
+	return count;
+}
+
+static ssize_t activate_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "%u\n", haptics->state);
+}
+
+static ssize_t activate_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+	if (val > 1)
+		return count;
+
+	if (haptics->haptic_rtp_mode)
+		return count;
+
+	hrtimer_cancel(&haptics->vibrator_timer);
+	if (val == 0 && !haptics->state)
+		return count;
+
+	haptics->state = val;
+	cancel_work_sync(&haptics->vibrator_work);
+	schedule_work(&haptics->vibrator_work);
+	return count;
+}
+
+static ssize_t vmax_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "0x%02x\n", haptics->vmax);
+}
+
+static ssize_t vmax_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	mutex_lock(&haptics->lock);
+	if (val <= 255) {
+		haptics->gain = (u8)((val * AW8695_HAPTIC_DEFAULT_GAIN) / 255);
+	} else if (val <= 2400) {
+		aw8695_convert_level_to_vmax(haptics, val);
+	} else {
+		haptics->vmax = AW8695_HAPTIC_HIGH_VMAX_REG;
+		haptics->gain = AW8695_HAPTIC_DEFAULT_GAIN;
+	}
+	if (!haptics->haptic_rtp_mode) {
+		aw8695_haptic_set_gain(haptics, haptics->gain);
+		aw8695_haptic_set_bst_vol(haptics, haptics->vmax);
+	}
+	mutex_unlock(&haptics->lock);
+	return count;
+}
+
+static ssize_t gain_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "0x%02x\n", haptics->gain);
+}
+
+static ssize_t gain_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	if (val > AW8695_HAPTIC_DEFAULT_GAIN)
+		val = AW8695_HAPTIC_DEFAULT_GAIN;
+
+	mutex_lock(&haptics->lock);
+	haptics->gain = (u8)val;
+	if (!haptics->haptic_rtp_mode)
+		aw8695_haptic_set_gain(haptics, haptics->gain);
+	mutex_unlock(&haptics->lock);
+	return count;
+}
+
+static ssize_t waveform_index_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "%u\n", haptics->seq[0]);
+}
+
+static ssize_t waveform_index_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	mutex_lock(&haptics->lock);
+	if (!haptics->haptic_rtp_mode) {
+		aw8695_haptic_set_wav_seq(haptics, 0, (u8)val);
+		aw8695_haptic_set_wav_seq(haptics, 1, 0);
+		aw8695_haptic_set_wav_loop(haptics, 0, 0);
+	} else {
+		haptics->seq[0] = (u8)val;
+		haptics->seq[1] = 0;
+		haptics->loop[0] = 0;
+	}
+	if ((val == 0x10 || val == 0x11 || val == 0x12) && haptics->gain > 0x75)
+		haptics->gain = 0x75;
+	mutex_unlock(&haptics->lock);
+	return count;
+}
+
+static ssize_t seq_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < AW8695_HAPTIC_SEQ_SIZE; i++)
+		len += sysfs_emit_at(buf, len, "seq%d: 0x%02x\n", i + 1,
+				     haptics->seq[i]);
+	return len;
+}
+
+static ssize_t seq_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	unsigned int idx, val;
+
+	if (sscanf(buf, "%x %x", &idx, &val) == 2 &&
+	    idx < AW8695_HAPTIC_SEQ_SIZE) {
+		mutex_lock(&haptics->lock);
+		if (!haptics->haptic_rtp_mode)
+			aw8695_haptic_set_wav_seq(haptics, (u8)idx, (u8)val);
+		else
+			haptics->seq[idx] = (u8)val;
+		mutex_unlock(&haptics->lock);
+	}
+	return count;
+}
+
+static ssize_t loop_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < AW8695_HAPTIC_LOOP_SIZE; i++)
+		len += sysfs_emit_at(buf, len, "seq%d_loop: 0x%02x\n", i + 1,
+				     haptics->loop[i]);
+	return len;
+}
+
+static ssize_t loop_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	unsigned int idx, val;
+
+	if (sscanf(buf, "%x %x", &idx, &val) == 2 &&
+	    idx < AW8695_HAPTIC_LOOP_SIZE) {
+		mutex_lock(&haptics->lock);
+		if (!haptics->haptic_rtp_mode)
+			aw8695_haptic_set_wav_loop(haptics, (u8)idx, (u8)val);
+		else
+			haptics->loop[idx] = (u8)(val & 0x0f);
+		mutex_unlock(&haptics->lock);
+	}
+	return count;
+}
+
+static ssize_t f0_show(struct device *dev, struct device_attribute *attr,
+		       char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "%u\n", haptics->f0);
+}
+
+static ssize_t cali_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "%u (trim=0x%02x)\n", haptics->f0,
+			  haptics->f0_cali_lra);
+}
+
+static ssize_t cali_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	if (val) {
+		mutex_lock(&haptics->ioctl_lock);
+		mutex_lock(&haptics->lock);
+		if (!haptics->haptic_rtp_mode)
+			aw8695_haptic_f0_calibration(haptics);
+		mutex_unlock(&haptics->lock);
+		mutex_unlock(&haptics->ioctl_lock);
+	}
+	return count;
+}
+
+static ssize_t ram_update_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "loaded=%d len=%zu base=0x%04x csum=0x%04x\n",
+			  haptics->ram_fw_loaded, haptics->ram_fw_len,
+			  haptics->ram_base_addr, haptics->ram_checksum);
+}
+
+static ssize_t ram_update_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	if (val)
+		aw8695_ram_update(haptics);
+	return count;
+}
+
+static ssize_t osc_cali_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "%lld\n", haptics->osc_microsecond);
+}
+
+static ssize_t osc_cali_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	if (val == 3)
+		aw8695_rtp_osc_calibration(haptics, true);
+	else if (val == 1)
+		aw8695_rtp_osc_calibration(haptics, false);
+
+	return count;
+}
+
+static ssize_t osc_data_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	return sysfs_emit(buf, "%u\n", haptics->osc_cali_lra);
+}
+
+static ssize_t osc_data_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	mutex_lock(&haptics->lock);
+	if (val == 0) {
+		haptics->osc_cali_lra = 0;
+		haptics->osc_calibrated = false;
+	} else {
+		haptics->osc_cali_lra = (u8)(val & 0x3f);
+		haptics->osc_calibrated = true;
+	}
+	mutex_unlock(&haptics->lock);
+	return count;
+}
+
+static ssize_t vbat_monitor_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	mutex_lock(&haptics->lock);
+	if (!haptics->haptic_rtp_mode)
+		aw8695_haptic_get_vbat(haptics);
+	mutex_unlock(&haptics->lock);
+
+	return sysfs_emit(buf, "%u\n", haptics->vbat);
+}
+
+static ssize_t lra_resistance_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
+
+	mutex_lock(&haptics->lock);
+	if (!haptics->haptic_rtp_mode)
+		aw8695_haptic_get_lra_resistance(haptics);
+	mutex_unlock(&haptics->lock);
+
+	return sysfs_emit(buf, "%u\n", haptics->lra_resistance);
+}
+
+static DEVICE_ATTR_RW(state);
+static DEVICE_ATTR_RW(duration);
+static DEVICE_ATTR_RW(activate);
+static DEVICE_ATTR_RW(vmax);
+static DEVICE_ATTR_RW(gain);
+static DEVICE_ATTR_RW(waveform_index);
+static DEVICE_ATTR_RW(seq);
+static DEVICE_ATTR_RW(loop);
+static DEVICE_ATTR_RO(f0);
+static DEVICE_ATTR_RW(cali);
+static DEVICE_ATTR_RW(ram_update);
+static DEVICE_ATTR_RW(osc_cali);
+static DEVICE_ATTR_RW(osc_data);
+static DEVICE_ATTR_RO(vbat_monitor);
+static DEVICE_ATTR_RO(lra_resistance);
+
+static struct attribute *aw8695_vibrator_attrs[] = {
+	&dev_attr_state.attr,
+	&dev_attr_duration.attr,
+	&dev_attr_activate.attr,
+	&dev_attr_vmax.attr,
+	&dev_attr_gain.attr,
+	&dev_attr_waveform_index.attr,
+	&dev_attr_seq.attr,
+	&dev_attr_loop.attr,
+	&dev_attr_f0.attr,
+	&dev_attr_cali.attr,
+	&dev_attr_ram_update.attr,
+	&dev_attr_osc_cali.attr,
+	&dev_attr_osc_data.attr,
+	&dev_attr_vbat_monitor.attr,
+	&dev_attr_lra_resistance.attr,
+	NULL,
+};
+
+ATTRIBUTE_GROUPS(aw8695_vibrator);
+
+static ssize_t aw8695_touch_style_read(struct file *filp, char __user *buf,
+				       size_t count, loff_t *ppos)
+{
+	struct aw8695_data *haptics = pde_data(file_inode(filp));
+	char page[8];
+	int len;
+
+	len = scnprintf(page, sizeof(page), "%u\n", haptics->vibration_style);
+	return simple_read_from_buffer(buf, count, ppos, page, len);
+}
+
+static ssize_t aw8695_touch_style_write(struct file *filp,
+					const char __user *buf, size_t count,
+					loff_t *ppos)
+{
+	struct aw8695_data *haptics = pde_data(file_inode(filp));
+	char kbuf[8] = { 0 };
+	int val, err;
+
+	if (count >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+
+	err = kstrtoint(strim(kbuf), 0, &val);
+	if (err)
+		return err;
+
+	if (val == AW8695_VIBRATION_STYLE_SOFT)
+		haptics->vibration_style = AW8695_VIBRATION_STYLE_SOFT;
+	else
+		haptics->vibration_style = AW8695_VIBRATION_STYLE_CRISP;
+
+	aw8695_ram_update(haptics);
+	return count;
+}
+
+static const struct proc_ops aw8695_touch_style_ops = {
+	.proc_read = aw8695_touch_style_read,
+	.proc_write = aw8695_touch_style_write,
+	.proc_lseek = default_llseek,
+};
+
+static void aw8695_vibrator_cleanup(void *data)
+{
+	struct aw8695_data *haptics = data;
+
+	if (haptics->proc_touch_style)
+		proc_remove(haptics->proc_touch_style);
+	if (haptics->proc_dir)
+		proc_remove(haptics->proc_dir);
+	cancel_delayed_work_sync(&haptics->ram_work);
+	hrtimer_cancel(&haptics->vibrator_timer);
+	cancel_work_sync(&haptics->vibrator_work);
+	kvfree(haptics->ram_fw_data);
+}
+
+static int aw8695_vibrator_init(struct aw8695_data *haptics)
+{
+	struct device *dev = &haptics->client->dev;
+	int err;
+
+	haptics->seq[0] = 1;
+	haptics->gain = AW8695_HAPTIC_DEFAULT_GAIN;
+	haptics->vmax = AW8695_HAPTIC_DEFAULT_VMAX;
+
+	hrtimer_setup(&haptics->vibrator_timer, aw8695_vibrator_timer_func,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	INIT_WORK(&haptics->vibrator_work, aw8695_vibrator_work_routine);
+	INIT_DELAYED_WORK(&haptics->ram_work, aw8695_ram_work_routine);
+
+	err = devm_add_action_or_reset(dev, aw8695_vibrator_cleanup, haptics);
+	if (err)
+		return err;
+
+	haptics->cdev.name = "vibrator";
+	haptics->cdev.max_brightness = LED_FULL;
+	haptics->cdev.brightness_set_blocking = aw8695_haptic_brightness_set;
+	haptics->cdev.groups = aw8695_vibrator_groups;
+
+	err = devm_led_classdev_register(dev, &haptics->cdev);
+	if (err) {
+		dev_warn(dev, "Failed to register /sys/class/leds/vibrator: %d\n", err);
+		return err;
+	}
+
+	haptics->proc_dir = proc_mkdir("vibrator", NULL);
+	if (haptics->proc_dir) {
+		haptics->proc_touch_style = proc_create_data(
+			"touch_style", 0664, haptics->proc_dir,
+			&aw8695_touch_style_ops, haptics);
+		if (!haptics->proc_touch_style)
+			dev_warn(dev, "Failed to create /proc/vibrator/touch_style\n");
+	} else {
+		dev_warn(dev, "Failed to create /proc/vibrator\n");
+	}
+
+	schedule_delayed_work(&haptics->ram_work,
+			      msecs_to_jiffies(AW8695_RAM_FW_DELAY_MS));
 	return 0;
 }
 
@@ -1992,7 +3287,9 @@ static int aw8695_probe(struct i2c_client *client)
 
 	mutex_init(&haptics->lock);
 	mutex_init(&haptics->ioctl_lock);
+	mutex_init(&haptics->qos_lock);
 	haptics->f0 = haptics->f0_preset;
+	haptics->ram_base_addr = AW8695_RAM_BASE_ADDR;
 
 	haptics->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(haptics->reset_gpio))
@@ -2013,8 +3310,11 @@ static int aw8695_probe(struct i2c_client *client)
 		return dev_err_probe(dev, err, "Failed to init aw8695 sram\n");
 
 	err = aw8695_richtap_init(haptics);
-	if (!err)
+	if (!err) {
+		if (aw8695_vibrator_init(haptics))
+			dev_warn(dev, "Legacy vibrator sysfs init failed, continuing with RichTap\n");
 		return 0;
+	}
 
 	dev_warn(dev, "RichTap init failed (%d), falling back to input-ff\n", err);
 
