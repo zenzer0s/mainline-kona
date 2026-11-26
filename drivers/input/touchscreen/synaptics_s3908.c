@@ -233,6 +233,7 @@ struct tcm_data {
 	struct proc_dir_entry *proc_dir;
 	u32 gesture_mask;
 	u16 default_noise_length;
+	bool zero_len_cmd_3byte;
 	bool game_mode;
 	bool screen_on;
 	bool in_gesture_mode;
@@ -260,12 +261,15 @@ static int tcm_send_cmd(struct tcm_data *tcm, struct tcm_cmd *cmd)
 	dev_dbg(&client->dev, "sending command %#x len %u\n", cmd->cmd, payload_len);
 
 	/*
-	 * Synaptics TCM I2C commands always carry the 3-byte header
-	 * [cmd, len_lo, len_hi], even when payload_len == 0.
+	 * Zero-payload TCM commands are sent as 1 byte [cmd] by default (matching
+	 * mainline synaptics_s3908 and required by aftermarket OnePlus 8T panels
+	 * that ignore 3-byte [cmd 00 00] writes). tcm_hw_init() falls back to
+	 * 3-byte headers automatically if a firmware revision requires them.
 	 */
 	msg.addr = client->addr;
 	msg.flags = 0;
-	msg.len = sizeof(*cmd) + payload_len;
+	msg.len = (payload_len || tcm->zero_len_cmd_3byte) ?
+		  (sizeof(*cmd) + payload_len) : 1;
 	msg.buf = (u8 *)cmd;
 
 	mutex_lock(&tcm->rw_mutex);
@@ -606,6 +610,10 @@ static void tcm_report_objects(struct tcm_data *tcm,
 		major_width = objs[idx].width_y;
 		if (minor_width > major_width)
 			swap(major_width, minor_width);
+		if (!major_width)
+			major_width = 10;
+		if (!minor_width)
+			minor_width = major_width;
 
 		dev_dbg(&tcm->client->dev, "touch report: idx %u x %u y %u\n",
 			idx, objs[idx].x, objs[idx].y);
@@ -619,7 +627,7 @@ static void tcm_report_objects(struct tcm_data *tcm,
 		input_report_abs(tcm->input, ABS_MT_TOUCH_MAJOR, major_width);
 		input_report_abs(tcm->input, ABS_MT_TOUCH_MINOR, minor_width);
 		input_report_abs(tcm->input, ABS_MT_PRESSURE,
-				 objs[idx].z ? objs[idx].z : 1);
+				 objs[idx].z ? objs[idx].z : major_width);
 	}
 
 	input_mt_sync_frame(tcm->input);
@@ -739,11 +747,17 @@ static int tcm_handle_touch_report_dynamic(struct tcm_data *tcm,
 
 	/*
 	 * Aftermarket replacement OnePlus 8T panels may insert a 2-byte
-	 * 0xa5 0x03 transient prefix at bytes [8..9] when (payload[7] & 0x0f)
-	 * is 0, shifting the touch payload and dropping quick taps.
+	 * 0xa5 0x03 transient prefix at bytes [5..6] (shifting Object 0 from
+	 * byte 7 to byte 9) or at bytes [8..9] when (payload[7] & 0x0f) == 0.
 	 */
-	if (payload_len >= 10 && (payload[7] & 0x0f) == 0x00 &&
-	    payload[8] == TCM_MESSAGE_MARKER && payload[9] == REPORT_CONTINUED_READ) {
+	if (payload_len >= 12 && payload[5] == TCM_MESSAGE_MARKER &&
+	    payload[6] == REPORT_CONTINUED_READ &&
+	    payload[7] == 0x00 && payload[8] == 0x00) {
+		memmove(&payload[5], &payload[7], payload_len - 7);
+		memset(&payload[payload_len - 2], 0, 2);
+	} else if (payload_len >= 10 && (payload[7] & 0x0f) == 0x00 &&
+		   payload[8] == TCM_MESSAGE_MARKER &&
+		   payload[9] == REPORT_CONTINUED_READ) {
 		memmove(&payload[8], &payload[10], payload_len - 10);
 		memset(&payload[payload_len - 2], 0, 2);
 	}
@@ -1025,6 +1039,11 @@ static int tcm_read_one_message(struct tcm_data *tcm)
 		return 0;
 	}
 
+	/* Only command responses and IDENTIFY reports should wake command waiters. */
+	if (header->code != REPORT_OK && header->code != REPORT_IDENTIFY &&
+	    header->code != REPORT_NOT_IMPLEMENTED && header->code != REPORT_ERROR)
+		return 0;
+
 	if (!completion_done(&tcm->response)) {
 		tcm->buf_size = total_len;
 		memcpy(tcm->buf, buf, total_len);
@@ -1068,20 +1087,43 @@ static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 	u32 dt_x = 0, dt_y = 0;
 
 	/*
-	 * Identify first (matching OPlus synaptics_tcm_oncell). Only issue
-	 * TCM_RUN_APPLICATION_FIRMWARE if the controller booted in bootloader
-	 * mode; some replacement panels reply with an empty REPORT_OK to 0x14
-	 * when already in application mode.
+	 * Identify first (matching OPlus synaptics_tcm_oncell). Try 1-byte
+	 * zero-payload commands first (required by aftermarket replacement
+	 * panels that ignore 3-byte [cmd 00 00] frames), and fall back to
+	 * 3-byte command headers if both 0x02 and 0x14 time out.
 	 */
-	ret = tcm_read_message(tcm, TCM_IDENTIFY, &id, sizeof(id));
-	if (ret) {
+	for (retry = 0; retry < 2; retry++) {
+		tcm->zero_len_cmd_3byte = (retry == 1);
+		memset(&id, 0, sizeof(id));
+
+		ret = tcm_read_message(tcm, TCM_IDENTIFY, &id, sizeof(id));
+		if (!ret)
+			break;
+
 		dev_warn(&tcm->client->dev,
-			 "TCM_IDENTIFY failed (%d), trying RUN_APPLICATION_FIRMWARE\n", ret);
+			 "TCM_IDENTIFY (%u-byte) failed (%d), trying RUN_APPLICATION_FIRMWARE\n",
+			 tcm->zero_len_cmd_3byte ? 3 : 1, ret);
 		ret = tcm_read_message(tcm, TCM_RUN_APPLICATION_FIRMWARE, &id, sizeof(id));
-		if (ret) {
-			dev_err(&tcm->client->dev, "failed to identify device: %d\n", ret);
-			return ret;
-		}
+		if (!ret)
+			break;
+
+		if (ret != -ETIMEDOUT)
+			break;
+	}
+	if (ret) {
+		dev_err(&tcm->client->dev, "failed to identify device: %d\n", ret);
+		return ret;
+	}
+
+	if (id.mode == 0) {
+		/*
+		 * Some panels answer TCM_RUN_APPLICATION_FIRMWARE with an
+		 * empty REPORT_OK when already in application mode; query
+		 * TCM_IDENTIFY to populate part_number/mode.
+		 */
+		msleep(20);
+		if (tcm_read_message(tcm, TCM_IDENTIFY, &id, sizeof(id)))
+			id.mode = MODE_APPLICATION;
 	}
 
 	if (id.mode != MODE_APPLICATION) {
