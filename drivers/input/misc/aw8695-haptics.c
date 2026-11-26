@@ -738,7 +738,104 @@ static int aw8695_haptics_play(struct input_dev *dev, void *data,
 	return 0;
 }
 
-static void aw8695_hw_reset(struct aw8695_data *haptics); // FIXME
+static void aw8695_hw_reset(struct aw8695_data *haptics);
+static int aw8695_ram_init(struct aw8695_data *haptics);
+
+static int aw8695_restore_config(struct aw8695_data *haptics)
+{
+	int err;
+
+	err = regmap_write(haptics->regmap, AW8695_ID, AW8695_RESET);
+	if (err)
+		return err;
+	usleep_range(1000, 1500);
+
+	err = aw8695_interrupt_clear(haptics);
+	if (err)
+		return err;
+
+	err = regmap_update_bits(haptics->regmap, AW8695_DBGCTRL,
+		AW8695_DBGCTRL_INT_MODE_MASK, AW8695_DBGCTRL_INT_MODE_EDGE);
+	if (err)
+		return err;
+
+	err = aw8695_set_work_mode(haptics, AW8695_STANDBY_MODE);
+	if (err)
+		return err;
+
+	err = regmap_update_bits(haptics->regmap, AW8695_PWMDBG,
+		AW8695_PWMDBG_PWM_MODE_MASK, AW8695_PWMDBG_PWM_24K);
+	if (err)
+		return err;
+
+	err = regmap_write(haptics->regmap, AW8695_BSTDBG1, haptics->boost_debug[0]);
+	if (err)
+		return err;
+	err = regmap_write(haptics->regmap, AW8695_BSTDBG2, haptics->boost_debug[1]);
+	if (err)
+		return err;
+	err = regmap_write(haptics->regmap, AW8695_BSTDBG3, haptics->boost_debug[2]);
+	if (err)
+		return err;
+	err = regmap_write(haptics->regmap, AW8695_TSET, haptics->tset);
+	if (err)
+		return err;
+	err = regmap_write(haptics->regmap, AW8695_R_SPARE, haptics->r_spare);
+	if (err)
+		return err;
+
+	err = regmap_update_bits(haptics->regmap, AW8695_ANADBG,
+		AW8695_ANADBG_IOC_MASK, AW8695_ANADBG_IOC_4P65A);
+	if (err)
+		return err;
+	err = regmap_update_bits(haptics->regmap, AW8695_BSTCFG,
+		AW8695_BSTCFG_PEAKCUR_MASK,
+		haptics->chipid == AW8697_CHIPID ?
+			AW8695_BSTCFG_PEAKCUR_3P5A : AW8695_BSTCFG_PEAKCUR_2A);
+	if (err)
+		return err;
+	err = regmap_update_bits(haptics->regmap, AW8695_DETCTRL,
+		AW8695_DETCTRL_PROTECT_MASK, AW8695_DETCTRL_PROTECT_NO_ACTION);
+	if (err)
+		return err;
+	err = regmap_update_bits(haptics->regmap, AW8695_PWMPRC,
+		AW8695_PWMPRC_PRC_ENABLE, 0);
+	if (err)
+		return err;
+	err = regmap_update_bits(haptics->regmap, AW8695_PRLVL,
+		AW8695_PRLVL_PR_ENABLE, 0);
+	if (err)
+		return err;
+	err = regmap_update_bits(haptics->regmap, AW8695_BST_AUTO,
+		AW8695_BST_AUTO_BST_AUTOSW_MASK, AW8695_BST_AUTO_BST_MANUAL_BOOST);
+	if (err)
+		return err;
+	err = regmap_update_bits(haptics->regmap, AW8695_ADCTEST,
+		AW8695_ADCTEST_VBAT_MODE_MASK, AW8695_ADCTEST_VBAT_HW_COMP);
+	if (err)
+		return err;
+	err = regmap_write(haptics->regmap, AW8695_TRIM_LRA, haptics->f0_cali_lra);
+	if (err)
+		return err;
+	err = regmap_write(haptics->regmap, AW8695_BEMF_VTHH_H,
+			FIELD_GET(AW8695_HIGH_MASK, haptics->bemf_vthh));
+	if (err)
+		return err;
+	err = regmap_write(haptics->regmap, AW8695_BEMF_VTHH_L,
+			FIELD_GET(AW8695_LOW_MASK, haptics->bemf_vthh));
+	if (err)
+		return err;
+	err = regmap_write(haptics->regmap, AW8695_BEMF_VTHL_H,
+			FIELD_GET(AW8695_HIGH_MASK, haptics->bemf_vthl));
+	if (err)
+		return err;
+	err = regmap_write(haptics->regmap, AW8695_BEMF_VTHL_L,
+			FIELD_GET(AW8695_LOW_MASK, haptics->bemf_vthl));
+	if (err)
+		return err;
+
+	return aw8695_ram_init(haptics);
+}
 
 static int aw8695_haptics_stop(struct aw8695_data *haptics)
 {
@@ -754,10 +851,9 @@ static int aw8695_haptics_stop(struct aw8695_data *haptics)
 	err = regmap_read_poll_timeout(haptics->regmap, AW8695_GLB_STATE, read_buf,
 			(read_buf & 0x0f) == 0, 500, 2000 * 100);
 	if (err) {
-		dev_err(dev, "Did not enter standby: %d\n", err);
-		// FIXME
+		dev_err(dev, "Did not enter standby: %d, resetting controller\n", err);
 		aw8695_hw_reset(haptics);
-		return err;
+		return aw8695_restore_config(haptics);
 	}
 
 	return aw8695_set_work_mode(haptics, AW8695_STANDBY_MODE);
@@ -1861,7 +1957,7 @@ static int aw8695_probe(struct i2c_client *client)
 	err = of_property_read_u32(dev->of_node, "awinic,f0-detection-trace",
 				   &haptics->f0_det_trace);
 	if (err)
-		dev_err_probe(dev, err, "Failed to read awinic,f0-detection-trace\n");
+		return dev_err_probe(dev, err, "Failed to read awinic,f0-detection-trace\n");
 
 	err = of_property_read_u8_array(dev->of_node, "awinic,boost-debug",
 					haptics->boost_debug, ARRAY_SIZE(haptics->boost_debug));
