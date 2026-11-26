@@ -22,6 +22,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kmsg_dump.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
@@ -68,34 +69,26 @@ static struct kmsg_dumper klog_dumper;
 static struct delayed_work klog_work;
 static DEFINE_MUTEX(klog_lock);
 
-/* Written by the dumper, read by the workqueue. */
+/* Written by the dumper / collector, read by the workqueue. */
 static char *klog_text;
 static size_t klog_text_len;
 static char *klog_xbl;
 static size_t klog_xbl_len;
+static char *klog_io_buf;
 static struct klog_header klog_hdr;
 
-/* Last snapshot, served by /proc/last_kmsg. */
+/* Previous boot's snapshot loaded once from disk, served by /proc/last_kmsg. */
 static char *klog_saved;
 static size_t klog_saved_len;
+static bool klog_prev_loaded;
+static bool klog_meta_written;
 
-static void klog_dump(struct kmsg_dumper *dumper,
-		      struct kmsg_dump_detail *detail)
+static void klog_load_from_disk(void);
+
+static void klog_capture_locked(void)
 {
-	enum kmsg_dump_reason reason = detail ? detail->reason : KMSG_DUMP_UNDEF;
 	struct kmsg_dump_iter iter;
 	size_t len = 0;
-
-	if (reason == KMSG_DUMP_UNDEF)
-		return;
-
-	/*
-	 * Runs in panic and watchdog context: no allocations, no block IO.
-	 * mutex_trylock keeps a tick spinning on the logbuf from stalling a
-	 * real dump; the next tick picks it up.
-	 */
-	if (!mutex_trylock(&klog_lock))
-		return;
 
 	kmsg_dump_rewind(&iter);
 	if (kmsg_dump_get_buffer(&iter, true, klog_text,
@@ -114,17 +107,38 @@ static void klog_dump(struct kmsg_dumper *dumper,
 		strscpy(klog_hdr.kernel, init_uts_ns.name.version,
 			sizeof(klog_hdr.kernel));
 	}
+}
+
+static void klog_dump(struct kmsg_dumper *dumper,
+		      struct kmsg_dump_detail *detail)
+{
+	enum kmsg_dump_reason reason = detail ? detail->reason : KMSG_DUMP_UNDEF;
+
+	if (reason == KMSG_DUMP_UNDEF)
+		return;
+
+	/*
+	 * Runs in panic and watchdog context: no allocations, no block IO.
+	 * mutex_trylock keeps a tick spinning on the logbuf from stalling a
+	 * real dump.
+	 */
+	if (!mutex_trylock(&klog_lock))
+		return;
+
+	klog_capture_locked();
 	mutex_unlock(&klog_lock);
 }
 
 /*
- * The dumper only runs on a kmsg_dump, so ask for one on every tick. With
- * printk.always_kmsg_dump=1 (already in the ROM command line) the OOPS
- * reason is accepted.
+ * Capture the kernel log buffer directly without invoking global kmsg_dump(),
+ * which would also trigger pstore/ramoops zlib compression with IRQs disabled
+ * and fabricate spurious Oops#N files in /sys/fs/pstore on normal boots.
  */
 static void klog_collect(void)
 {
-	kmsg_dump(KMSG_DUMP_OOPS);
+	mutex_lock(&klog_lock);
+	klog_capture_locked();
+	mutex_unlock(&klog_lock);
 }
 
 /*
@@ -170,7 +184,7 @@ static ssize_t klog_write_all(struct file *f, loff_t pos,
 	return done;
 }
 
-static void klog_write_snapshot_file(const char *path,
+static bool klog_write_snapshot_file(const char *path,
 				     const struct klog_header *hdr,
 				     const char *text, size_t len,
 				     const char *xbl, size_t xbl_len)
@@ -179,7 +193,7 @@ static void klog_write_snapshot_file(const char *path,
 	int ret;
 
 	if (IS_ERR(f))
-		return;
+		return false;
 
 	ret = klog_write_all(f, 0, (const char *)hdr, sizeof(*hdr));
 	if (ret == sizeof(*hdr))
@@ -188,13 +202,13 @@ static void klog_write_snapshot_file(const char *path,
 		klog_write_all(f, ret, xbl, xbl_len);
 	vfs_fsync(f, 0);
 	filp_close(f, NULL);
+	return true;
 }
 
 static void klog_flush(struct work_struct *work)
 {
 	struct klog_header hdr;
 	struct file *f;
-	char *text;
 	size_t len, xbl_len;
 	int ret;
 	bool written = false;
@@ -202,48 +216,49 @@ static void klog_flush(struct work_struct *work)
 	if (!klog_interval)
 		return;
 
-	klog_collect();
+	if (!klog_xbl_len)
+		klog_read_bootloader();
 
-	text = kmalloc(KLOG_MAX_TEXT, GFP_KERNEL);
-	if (!text)
-		goto requeue;
+	/*
+	 * Snapshot the previous boot's last_kmsg into memory BEFORE our first
+	 * write truncates either persistent file, so /proc/last_kmsg always
+	 * serves the previous boot rather than the current one.
+	 */
+	if (!klog_prev_loaded && !is_recovery_mode)
+		klog_load_from_disk();
+
+	klog_collect();
 
 	mutex_lock(&klog_lock);
 	memcpy(&hdr, &klog_hdr, sizeof(hdr));
 	len = klog_text_len;
 	if (len) {
-		memcpy(text, klog_text, len);
-		hdr.crc = crc32(0, text, len);
+		memcpy(klog_io_buf, klog_text, len);
+		hdr.crc = crc32(0, klog_io_buf, len);
 	}
 	xbl_len = klog_xbl_len;
 	mutex_unlock(&klog_lock);
 
-	if (!len || hdr.magic != KLOG_MAGIC) {
-		kfree(text);
+	if (!len || hdr.magic != KLOG_MAGIC)
 		goto requeue;
-	}
 
 	f = filp_open(klog_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (!IS_ERR(f)) {
 		ret = klog_write_all(f, 0, (const char *)&hdr, sizeof(hdr));
 		if (ret == sizeof(hdr))
-			ret = klog_write_all(f, ret, text, len);
+			ret = klog_write_all(f, ret, klog_io_buf, len);
 		if (ret == sizeof(hdr) + len && xbl_len)
 			klog_write_all(f, ret, klog_xbl, xbl_len);
 		vfs_fsync(f, 0);
 		filp_close(f, NULL);
 		written = true;
+		/* Persist is now mounted and overwritten; don't reload our own boot. */
+		klog_prev_loaded = true;
 	}
 
 	/* Also write to /metadata/bringup/last_kmsg for guaranteed persistent capture */
-	klog_write_snapshot_file("/metadata/bringup/last_kmsg", &hdr, text, len, klog_xbl, xbl_len);
-
-	mutex_lock(&klog_lock);
-	klog_saved_len = len;
-	memcpy(klog_saved, text, len);
-	mutex_unlock(&klog_lock);
-
-	kfree(text);
+	if (klog_write_snapshot_file("/metadata/bringup/last_kmsg", &hdr, klog_io_buf, len, klog_xbl, xbl_len))
+		klog_meta_written = true;
 
 	if (!written) {
 		/* Persist partition might not be mounted yet; retry in 1s */
@@ -286,16 +301,27 @@ static ssize_t klog_proc_read(struct file *file, char __user *buf,
 
 static void klog_load_from_disk(void)
 {
-	struct file *f;
+	static const char * const paths[] = {
+		KLOG_DIR "/last_kmsg",
+		"/metadata/bringup/last_kmsg",
+	};
+	struct file *f = ERR_PTR(-ENOENT);
 	loff_t pos = 0;
 	ssize_t n;
 	char *buf;
+	int i;
 
-	f = filp_open(KLOG_DIR "/last_kmsg", O_RDONLY, 0);
+	for (i = 0; i < ARRAY_SIZE(paths); i++) {
+		if (i == 1 && klog_meta_written)
+			continue;
+		f = filp_open(paths[i], O_RDONLY, 0);
+		if (!IS_ERR(f))
+			break;
+	}
 	if (IS_ERR(f))
 		return;
 
-	buf = kmalloc(KLOG_MAX_TEXT, GFP_KERNEL);
+	buf = kvmalloc(KLOG_MAX_TEXT, GFP_KERNEL);
 	if (!buf) {
 		filp_close(f, NULL);
 		return;
@@ -319,13 +345,14 @@ static void klog_load_from_disk(void)
 			klog_saved_len = n;
 			mutex_unlock(&klog_lock);
 		}
+		klog_prev_loaded = true;
 	}
-	kfree(buf);
+	kvfree(buf);
 }
 
 static int klog_proc_open(struct inode *inode, struct file *file)
 {
-	if (!klog_saved_len || is_recovery_mode)
+	if (!klog_prev_loaded || is_recovery_mode)
 		klog_load_from_disk();
 	if (!klog_saved_len)
 		return -ENODATA;
@@ -356,13 +383,15 @@ static void klog_check_mode(void)
 
 static int __init klog_flush_init(void)
 {
-	klog_text = kzalloc(KLOG_MAX_TEXT, GFP_KERNEL);
-	klog_saved = kzalloc(KLOG_MAX_TEXT, GFP_KERNEL);
-	klog_xbl = kzalloc(KLOG_MAX_TEXT / 4, GFP_KERNEL);
-	if (!klog_text || !klog_saved || !klog_xbl) {
-		kfree(klog_text);
-		kfree(klog_saved);
-		kfree(klog_xbl);
+	klog_text = kvzalloc(KLOG_MAX_TEXT, GFP_KERNEL);
+	klog_saved = kvzalloc(KLOG_MAX_TEXT, GFP_KERNEL);
+	klog_io_buf = kvzalloc(KLOG_MAX_TEXT, GFP_KERNEL);
+	klog_xbl = kvzalloc(KLOG_MAX_TEXT / 4, GFP_KERNEL);
+	if (!klog_text || !klog_saved || !klog_io_buf || !klog_xbl) {
+		kvfree(klog_text);
+		kvfree(klog_saved);
+		kvfree(klog_io_buf);
+		kvfree(klog_xbl);
 		return -ENOMEM;
 	}
 
@@ -372,7 +401,7 @@ static int __init klog_flush_init(void)
 	klog_read_bootloader();
 
 	klog_dumper.dump = klog_dump;
-	klog_dumper.max_reason = KMSG_DUMP_MAX;
+	klog_dumper.max_reason = KMSG_DUMP_EMERG;
 	if (kmsg_dump_register(&klog_dumper)) {
 		pr_err("klog: failed to register dumper\n");
 		return -EBUSY;
