@@ -214,10 +214,10 @@ static struct page **get_pages(struct drm_gem_object *obj)
 			return ptr;
 		}
 
-		/* For non-cached buffers, ensure the new pages are clean
+		/* For non-coherent buffers, ensure the new pages are clean
 		 * because display controller, GPU, etc. are not coherent:
 		 */
-		if (msm_obj->flags & MSM_BO_WC)
+		if (!(msm_obj->flags & MSM_BO_CACHED_COHERENT))
 			sync_for_device(msm_obj);
 
 		update_lru(obj);
@@ -239,11 +239,11 @@ static void put_pages(struct drm_gem_object *obj)
 
 	if (msm_obj->pages) {
 		if (msm_obj->sgt) {
-			/* For non-cached buffers, ensure the new
+			/* For non-coherent buffers, ensure the new
 			 * pages are clean because display controller,
 			 * GPU, etc. are not coherent:
 			 */
-			if (msm_obj->flags & MSM_BO_WC)
+			if (!(msm_obj->flags & MSM_BO_CACHED_COHERENT))
 				sync_for_cpu(msm_obj);
 
 			sg_free_table(msm_obj->sgt);

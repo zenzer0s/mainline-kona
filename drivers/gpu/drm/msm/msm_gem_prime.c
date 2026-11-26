@@ -5,6 +5,7 @@
  */
 
 #include <linux/dma-buf.h>
+#include <linux/dma-mapping.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_prime.h>
@@ -51,12 +52,56 @@ static void msm_gem_dmabuf_release(struct dma_buf *dma_buf)
 	drm_gem_dmabuf_release(dma_buf);
 }
 
+static int msm_gem_dmabuf_begin_cpu_access(struct dma_buf *dma_buf,
+					   enum dma_data_direction direction)
+{
+	struct drm_gem_object *obj = dma_buf->priv;
+	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+	int ret;
+
+	if (!(msm_obj->flags & MSM_BO_CACHED))
+		return 0;
+
+	ret = msm_gem_lock_interruptible(obj);
+	if (ret)
+		return ret;
+
+	if (msm_obj->sgt && msm_obj->sgt->nents)
+		dma_sync_sgtable_for_cpu(obj->dev->dev, msm_obj->sgt, direction);
+
+	msm_gem_unlock(obj);
+	return 0;
+}
+
+static int msm_gem_dmabuf_end_cpu_access(struct dma_buf *dma_buf,
+					 enum dma_data_direction direction)
+{
+	struct drm_gem_object *obj = dma_buf->priv;
+	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+	int ret;
+
+	if (!(msm_obj->flags & MSM_BO_CACHED))
+		return 0;
+
+	ret = msm_gem_lock_interruptible(obj);
+	if (ret)
+		return ret;
+
+	if (msm_obj->sgt && msm_obj->sgt->nents)
+		dma_sync_sgtable_for_device(obj->dev->dev, msm_obj->sgt, direction);
+
+	msm_gem_unlock(obj);
+	return 0;
+}
+
 static const struct dma_buf_ops msm_gem_prime_dmabuf_ops =  {
 	.attach = drm_gem_map_attach,
 	.detach = drm_gem_map_detach,
 	.map_dma_buf = drm_gem_map_dma_buf,
 	.unmap_dma_buf = drm_gem_unmap_dma_buf,
 	.release = msm_gem_dmabuf_release,
+	.begin_cpu_access = msm_gem_dmabuf_begin_cpu_access,
+	.end_cpu_access = msm_gem_dmabuf_end_cpu_access,
 	.mmap = drm_gem_dmabuf_mmap,
 	.vmap = drm_gem_dmabuf_vmap,
 	.vunmap = drm_gem_dmabuf_vunmap,
