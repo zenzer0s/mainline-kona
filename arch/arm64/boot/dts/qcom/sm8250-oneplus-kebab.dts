@@ -367,6 +367,8 @@
 		reset-gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
 		vdd-supply = <&vreg_l13a_ts_3p0>;
 		vcc-supply = <&vreg_l1c_1p8>;
+		touchscreen-size-x = <1080>;
+		touchscreen-size-y = <2400>;
 		pinctrl-0 = <&ts_int_default>;
 		pinctrl-1 = <&ts_rst_suspend>;
 		pinctrl-names = "default";
