@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include <linux/regmap.h>
 #include <sound/soc.h>
+#include <sound/tlv.h>
 
 #define TFA987X_SYS_CTRL0		0x00
 #define TFA987X_SYS_CTRL0_PWDN_MSK	BIT(0)
@@ -65,7 +66,8 @@
 #define TFA987X_TDM_CFG8		0x61
 #define TFA987X_TDM_CFG8_DCG_MSK	GENMASK(5, 2)
 #define TFA987X_TDM_CFG8_SPKG_MSK	GENMASK(9, 6)
-#define TFA987X_SPKG_SPEAKER		4
+#define TFA987X_SPKG_MAX		15
+#define TFA987X_SPKG_SPEAKER		6
 #define TFA987X_SPKG_RECEIVER		13
 
 #define TFA987X_LOW_NOISE_GAIN1		0x62
@@ -90,11 +92,19 @@
 #define TFA9874_DCDC_CTRL6_DCVOF_MSK	GENMASK(8,  3)
 #define TFA9874_DCDC_CTRL6_DCVOS_MSK	GENMASK(14,  9)
 
+#define TFA987X_KEY1_REG		0x0f
+#define TFA987X_KEY1_UNLOCK		0x5a6b
+#define TFA987X_KEY2_REG		0xa1
+#define TFA987X_KEY2_UNLOCK		0x005a
+#define TFA987X_MTPKEY1_REG		0xa0
+#define TFA987X_MTPKEY1_SEED_REG	0xfb
+
 struct tfa987x_priv {
 	struct mutex lock;
 	bool receiver_mode;
 	bool powered;
 	bool has_dcdc;
+	u8 speaker_spkg;
 };
 
 static int tfa987x_pwup_event(struct snd_soc_dapm_widget *w,
@@ -178,7 +188,7 @@ static int tfa987x_receiver_mode_put(struct snd_kcontrol *kcontrol,
 					      TFA987X_TDM_CFG8_SPKG_MSK,
 					      FIELD_PREP(TFA987X_TDM_CFG8_SPKG_MSK,
 							 val ? TFA987X_SPKG_RECEIVER :
-							       TFA987X_SPKG_SPEAKER));
+							       priv->speaker_spkg));
 		snd_soc_component_update_bits(component, TFA987X_SYS_CTRL2,
 					      TFA987X_SYS_CTRL2_INPLEV_MSK,
 					      val ? TFA987X_SYS_CTRL2_INPLEV_MSK : 0);
@@ -196,6 +206,51 @@ static int tfa987x_receiver_mode_put(struct snd_kcontrol *kcontrol,
 	return changed;
 }
 
+static int tfa987x_speaker_vol_get(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct tfa987x_priv *priv = snd_soc_component_get_drvdata(component);
+
+	mutex_lock(&priv->lock);
+	ucontrol->value.integer.value[0] = TFA987X_SPKG_MAX - priv->speaker_spkg;
+	mutex_unlock(&priv->lock);
+
+	return 0;
+}
+
+static int tfa987x_speaker_vol_put(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct tfa987x_priv *priv = snd_soc_component_get_drvdata(component);
+	long val = ucontrol->value.integer.value[0];
+	u8 new_spkg;
+	int changed;
+
+	if (val < 0 || val > TFA987X_SPKG_MAX)
+		return -EINVAL;
+
+	new_spkg = TFA987X_SPKG_MAX - val;
+
+	mutex_lock(&priv->lock);
+	changed = (priv->speaker_spkg != new_spkg);
+	if (changed) {
+		priv->speaker_spkg = new_spkg;
+		if (!priv->receiver_mode)
+			snd_soc_component_update_bits(component, TFA987X_TDM_CFG8,
+						      TFA987X_TDM_CFG8_SPKG_MSK,
+						      FIELD_PREP(TFA987X_TDM_CFG8_SPKG_MSK,
+								 new_spkg));
+	}
+	mutex_unlock(&priv->lock);
+
+	return changed;
+}
+
+/* TDMSPKG: 1.5 dB attenuation per step (SPKG=15 -> -22.5 dB, SPKG=0 -> 0 dB) */
+static const DECLARE_TLV_DB_SCALE(tfa987x_spkg_tlv, -2250, 150, 0);
+
 static const struct snd_kcontrol_new tfa987x_playback_switch =
 	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0);
 
@@ -203,6 +258,9 @@ static const struct snd_kcontrol_new tfa987x_controls[] = {
 	SOC_SINGLE_BOOL_EXT("Receiver Mode Switch", 0,
 			    tfa987x_receiver_mode_get,
 			    tfa987x_receiver_mode_put),
+	SOC_SINGLE_EXT_TLV("Speaker Volume", SND_SOC_NOPM, 0, TFA987X_SPKG_MAX, 0,
+			   tfa987x_speaker_vol_get, tfa987x_speaker_vol_put,
+			   tfa987x_spkg_tlv),
 };
 
 static const struct snd_soc_dapm_widget tfa987x_dapm_widgets[] = {
@@ -332,6 +390,34 @@ static bool tfa987x_setup_dcdc(struct device *dev, struct regmap *rmap, u16 rev)
 	return true;
 }
 
+static void tfa9874_init_0c74(struct regmap *rmap)
+{
+	unsigned int seed = 0;
+
+	/* Unlock key 1 and key 2 for rev 0x0c74 optimal DCDC & analog trim */
+	regmap_write(rmap, TFA987X_KEY1_REG, TFA987X_KEY1_UNLOCK);
+	if (regmap_read(rmap, TFA987X_MTPKEY1_SEED_REG, &seed) == 0)
+		regmap_write(rmap, TFA987X_MTPKEY1_REG, seed ^ 0x005a);
+	regmap_write(rmap, TFA987X_KEY2_REG, TFA987X_KEY2_UNLOCK);
+
+	regmap_write(rmap, TFA987X_SYS_CTRL2, 0x22c8);
+	regmap_write(rmap, TFA987X_AMP_CFG, 0x57dc);
+	regmap_write(rmap, 0x53, 0x003e);
+	regmap_write(rmap, 0x56, 0x0400);
+	regmap_write(rmap, TFA987X_CURSENSE_COMP, 0x00a5);
+	regmap_write(rmap, TFA987X_DCDC_CTRL0, 0x07f8);
+	regmap_write(rmap, 0x73, 0x0047);
+	regmap_write(rmap, TFA987X_DCDC_CTRL4, 0x5098);
+	regmap_write(rmap, TFA987X_DCDC_CTRL5, 0x8d28);
+	regmap_write(rmap, 0x80, 0x0000);
+	regmap_write(rmap, 0x83, 0x0799);
+	regmap_write(rmap, 0x84, 0x0081);
+
+	/* Re-lock key 2 and key 1 */
+	regmap_write(rmap, TFA987X_KEY2_REG, 0x0000);
+	regmap_write(rmap, TFA987X_KEY1_REG, 0x0000);
+}
+
 static int tfa987x_i2c_probe(struct i2c_client *i2c)
 {
 	struct device *dev = &i2c->dev;
@@ -346,6 +432,7 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 		return -ENOMEM;
 
 	mutex_init(&priv->lock);
+	priv->speaker_spkg = TFA987X_SPKG_SPEAKER;
 	i2c_set_clientdata(i2c, priv);
 
 	rmap = devm_regmap_init_i2c(i2c, &tfa987x_regmap_config);
@@ -375,6 +462,10 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 
 	/* Perform soft reset */
 	regmap_write(rmap, TFA987X_SYS_CTRL0, TFA987X_SYS_CTRL0_I2CR_MSK);
+
+	/* Apply silicon-optimal DCDC/analog defaults before DT overrides */
+	if (rev == 0x0c74)
+		tfa9874_init_0c74(rmap);
 
 	/* Setup DC-DC Converter if we have configuration */
 	priv->has_dcdc = tfa987x_setup_dcdc(dev, rmap, rev);
@@ -421,7 +512,7 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 		regmap_update_bits(rmap, TFA987X_TDM_CFG8,
 				 TFA987X_TDM_CFG8_SPKG_MSK |
 				 TFA987X_TDM_CFG8_DCG_MSK,
-				 FIELD_PREP(TFA987X_TDM_CFG8_SPKG_MSK, TFA987X_SPKG_SPEAKER) |
+				 FIELD_PREP(TFA987X_TDM_CFG8_SPKG_MSK, priv->speaker_spkg) |
 				 FIELD_PREP(TFA987X_TDM_CFG8_DCG_MSK, 0xf));
 		regmap_update_bits(rmap, TFA987X_MODE1_DET1,
 				 TFA987X_MODE1_DET1_LPM1MODE_MSK,
