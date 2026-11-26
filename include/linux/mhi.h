@@ -823,8 +823,16 @@ int mhi_get_channel_doorbell_offset(struct mhi_controller *mhi_cntrl, u32 *chdb_
 /**
  * mhi_poll_irqs - Run the MHI interrupt handlers without an interrupt
  * @mhi_cntrl: MHI controller
+ *
+ * Return: true if any event ring had pending work or controller is still booting
  */
-void mhi_poll_irqs(struct mhi_controller *mhi_cntrl);
+bool mhi_poll_irqs(struct mhi_controller *mhi_cntrl);
+
+/**
+ * mhi_poll_intvec - Poll MHI state/execution-environment registers in process context
+ * @mhi_cntrl: MHI controller
+ */
+void mhi_poll_intvec(struct mhi_controller *mhi_cntrl);
 
 /* Hand the device a buffer for its crash reason string (QTI SFR_CFG) */
 int mhi_setup_sfr(struct mhi_controller *mhi_cntrl, size_t len);

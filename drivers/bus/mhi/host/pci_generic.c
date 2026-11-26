@@ -1105,6 +1105,8 @@ struct mhi_pci_device {
 	bool fw_seen;
 	/* kebab SDX55: some MSIs are lost, so also poll the MHI vectors */
 	struct delayed_work poll_work;
+	unsigned long poll_delay;
+	unsigned long last_intvec_jiffies;
 	bool poll_irqs;
 	bool poll_paused;
 	/* scratch page mapped at the MSI address in the device's IOMMU domain */
@@ -1167,14 +1169,34 @@ static void mhi_pci_poll(struct work_struct *work)
 {
 	struct mhi_pci_device *mhi_pdev = container_of(to_delayed_work(work),
 						       struct mhi_pci_device, poll_work);
+	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
+	unsigned long delay;
+	bool active;
 
 	if (!test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) ||
-	    !mhi_pdev->mhi_cntrl.bhi || READ_ONCE(mhi_pdev->poll_paused))
+	    !mhi_cntrl->bhi || READ_ONCE(mhi_pdev->poll_paused))
 		return;
 
-	mhi_poll_irqs(&mhi_pdev->mhi_cntrl);
-	if (!READ_ONCE(mhi_pdev->poll_paused))
-		queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
+	active = mhi_poll_irqs(mhi_cntrl);
+	if (mhi_cntrl->ee == MHI_EE_AMSS &&
+	    time_after_eq(jiffies, mhi_pdev->last_intvec_jiffies + HEALTH_CHECK_PERIOD)) {
+		mhi_pdev->last_intvec_jiffies = jiffies;
+		mhi_poll_intvec(mhi_cntrl);
+	}
+
+	if (active || mhi_cntrl->ee != MHI_EE_AMSS) {
+		mhi_pdev->poll_delay = 1;
+	} else {
+		delay = mhi_pdev->poll_delay ? mhi_pdev->poll_delay * 2 : 1;
+		mhi_pdev->poll_delay = min_t(unsigned long, delay, msecs_to_jiffies(50));
+	}
+
+	if (!READ_ONCE(mhi_pdev->poll_paused)) {
+		struct workqueue_struct *wq = mhi_pdev->poll_delay <= 1 ?
+					      system_highpri_wq : system_wq;
+
+		queue_delayed_work(wq, &mhi_pdev->poll_work, mhi_pdev->poll_delay);
+	}
 }
 
 static void mhi_pci_start(struct mhi_pci_device *mhi_pdev);
@@ -1514,8 +1536,11 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 	dev_dbg(&pdev->dev, "Recovery completed\n");
 
 	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
-	if (mhi_pdev->poll_irqs)
+	if (mhi_pdev->poll_irqs) {
+		mhi_pdev->poll_delay = 1;
+		mhi_pdev->last_intvec_jiffies = jiffies;
 		queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
+	}
 
 	if (!pdev->is_virtfn)
 		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
@@ -1590,8 +1615,11 @@ static void mhi_pci_start(struct mhi_pci_device *mhi_pdev)
 
 	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
 
-	if (mhi_pdev->poll_irqs)
+	if (mhi_pdev->poll_irqs) {
+		mhi_pdev->poll_delay = 1;
+		mhi_pdev->last_intvec_jiffies = jiffies;
 		queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
+	}
 
 	if (mhi_pdev->fw_wait_left) {
 		mhi_pdev->boot_dbg_left = 12;
@@ -1945,6 +1973,8 @@ static int __maybe_unused mhi_pci_runtime_resume(struct device *dev)
 
 	if (mhi_pdev->poll_irqs) {
 		WRITE_ONCE(mhi_pdev->poll_paused, false);
+		mhi_pdev->poll_delay = 1;
+		mhi_pdev->last_intvec_jiffies = jiffies;
 		queue_delayed_work(system_highpri_wq, &mhi_pdev->poll_work, 1);
 	}
 

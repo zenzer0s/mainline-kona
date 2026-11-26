@@ -563,26 +563,52 @@ exit_intvec:
 }
 
 /*
- * Run the interrupt handlers as if every MHI vector had fired. For hosts
- * where some device MSIs get lost (kebab's SDX55 in SBL), so state changes
- * and events are still picked up, at polling latency. Harmless when idle.
+ * Run the interrupt handlers without an interrupt. For hosts where some device
+ * MSIs get lost (kebab's SDX55), state changes and event rings are picked up at
+ * polling latency. In Mission Mode (MHI_EE_AMSS), only inspect coherent-RAM
+ * event ring read pointers so idle polling performs zero PCIe MMIO reads and
+ * allows PCIe ASPM L1.2; return true if any ring had pending events or the
+ * controller is still booting.
  */
-void mhi_poll_irqs(struct mhi_controller *mhi_cntrl)
+bool mhi_poll_irqs(struct mhi_controller *mhi_cntrl)
 {
 	struct mhi_event *mhi_event = mhi_cntrl->mhi_event;
+	bool active = false;
 	int i;
 
 	if (!mhi_cntrl->mhi_ctxt)
-		return;
+		return false;
+
+	for (i = 0; i < mhi_cntrl->total_ev_rings; i++, mhi_event++) {
+		struct mhi_event_ctxt *er_ctxt;
+		struct mhi_ring *ev_ring;
+		dma_addr_t ptr;
+
+		if (mhi_event->offload_ev)
+			continue;
+
+		ev_ring = &mhi_event->ring;
+		er_ctxt = &mhi_cntrl->mhi_ctxt->er_ctxt[mhi_event->er_index];
+		ptr = le64_to_cpu(er_ctxt->rp);
+		if (!is_valid_ring_ptr(ev_ring, ptr))
+			continue;
+		if (ev_ring->rp == mhi_to_virtual(ev_ring, ptr))
+			continue;
+
+		active = true;
+		mhi_irq_handler(0, mhi_event);
+	}
+
+	/*
+	 * Once in Mission Mode (AMSS), avoid per-poll PCIe MMIO reads so the
+	 * link can enter ASPM L1.2. State/error checks run at a slow cadence
+	 * via mhi_poll_intvec().
+	 */
+	if (mhi_cntrl->ee == MHI_EE_AMSS)
+		return active;
 
 	wake_up_all(&mhi_cntrl->state_event);
 	mhi_intvec_threaded_handler(0, mhi_cntrl);
-
-	for (i = 0; i < mhi_cntrl->total_ev_rings; i++, mhi_event++) {
-		if (mhi_event->offload_ev)
-			continue;
-		mhi_irq_handler(0, mhi_event);
-	}
 
 	/*
 	 * kebab's SDX55 SBL never posts an EE event on the control ring (the
@@ -611,8 +637,19 @@ void mhi_poll_irqs(struct mhi_controller *mhi_cntrl)
 			mhi_queue_state_transition(mhi_cntrl, st);
 		}
 	}
+
+	return true;
 }
 EXPORT_SYMBOL_GPL(mhi_poll_irqs);
+
+void mhi_poll_intvec(struct mhi_controller *mhi_cntrl)
+{
+	if (!mhi_cntrl->mhi_ctxt)
+		return;
+
+	mhi_intvec_threaded_handler(0, mhi_cntrl);
+}
+EXPORT_SYMBOL_GPL(mhi_poll_intvec);
 
 irqreturn_t mhi_intvec_handler(int irq_number, void *dev)
 {
