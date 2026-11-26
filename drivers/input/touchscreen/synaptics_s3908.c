@@ -535,6 +535,24 @@ static int tcm_probe(struct i2c_client *client)
 	return 0;
 }
 
+static int tcm_suspend(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+
+	disable_irq(client->irq);
+	return 0;
+}
+
+static int tcm_resume(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+
+	enable_irq(client->irq);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(tcm_pm_ops, tcm_suspend, tcm_resume);
+
 static const struct of_device_id syna_driver_ids[] = {
 	{
 		.compatible = "syna,s3908",
@@ -554,8 +572,9 @@ static struct i2c_driver syna_i2c_driver = {
 	.probe		= tcm_probe,
 	.id_table	= syna_i2c_ids,
 	.driver		= {
-	.name		= "synaptics-tcm",
-	.of_match_table	= syna_driver_ids,
+		.name		= "synaptics-tcm",
+		.of_match_table	= syna_driver_ids,
+		.pm		= pm_sleep_ptr(&tcm_pm_ops),
 	},
 };
 
