@@ -65,7 +65,7 @@
 #define TFA987X_TDM_CFG8		0x61
 #define TFA987X_TDM_CFG8_DCG_MSK	GENMASK(5, 2)
 #define TFA987X_TDM_CFG8_SPKG_MSK	GENMASK(9, 6)
-#define TFA987X_SPKG_SPEAKER		6
+#define TFA987X_SPKG_SPEAKER		4
 #define TFA987X_SPKG_RECEIVER		13
 
 #define TFA987X_LOW_NOISE_GAIN1		0x62
@@ -94,6 +94,7 @@ struct tfa987x_priv {
 	struct mutex lock;
 	bool receiver_mode;
 	bool powered;
+	bool has_dcdc;
 };
 
 static int tfa987x_pwup_event(struct snd_soc_dapm_widget *w,
@@ -169,6 +170,10 @@ static int tfa987x_receiver_mode_put(struct snd_kcontrol *kcontrol,
 	changed = (priv->receiver_mode != val);
 	if (changed) {
 		priv->receiver_mode = val;
+		snd_soc_component_update_bits(component, TFA987X_SYS_CTRL0,
+					      TFA987X_SYS_CTRL0_DCDC_MSK,
+					      (!val && priv->has_dcdc) ?
+					      TFA987X_SYS_CTRL0_DCDC_MSK : 0);
 		snd_soc_component_update_bits(component, TFA987X_TDM_CFG8,
 					      TFA987X_TDM_CFG8_SPKG_MSK,
 					      FIELD_PREP(TFA987X_TDM_CFG8_SPKG_MSK,
@@ -181,6 +186,10 @@ static int tfa987x_receiver_mode_put(struct snd_kcontrol *kcontrol,
 					      TFA987X_LOW_NOISE_GAIN1_LNMODE_MSK,
 					      FIELD_PREP(TFA987X_LOW_NOISE_GAIN1_LNMODE_MSK,
 							 val ? 3 : 0));
+		snd_soc_component_update_bits(component, TFA987X_MODE1_DET1,
+					      TFA987X_MODE1_DET1_LPM1MODE_MSK,
+					      FIELD_PREP(TFA987X_MODE1_DET1_LPM1MODE_MSK,
+							 val ? 0 : 2));
 	}
 	mutex_unlock(&priv->lock);
 
@@ -249,7 +258,7 @@ static const struct regmap_config tfa987x_regmap_config = {
 
 static bool tfa987x_setup_dcdc(struct device *dev, struct regmap *rmap, u16 rev)
 {
-	u32 mcc, dcvof, dcvos, dctrip, dctrip2 = 0;
+	u32 mcc = 0, dcvof = 0, dcvos = 0, dctrip = 0, dctrip2 = 0;
 	int i;
 	u32 *dest[] = { &mcc, &dcvof, &dcvos, &dctrip, &dctrip2 };
 	const char *props[] = { "max-coil-current",
@@ -262,6 +271,9 @@ static bool tfa987x_setup_dcdc(struct device *dev, struct regmap *rmap, u16 rev)
 		if (ret < 0 && ret != -EINVAL)
 			return false;
 	}
+
+	if (!(mcc || dcvof || dcvos || dctrip || dctrip2))
+		return false;
 
 	if (!FIELD_FIT(TFA987X_DCDC_CTRL0_MCC_MSK, mcc) ||
 	    !FIELD_FIT(TFA987X_DCDC_CTRL4_DCTRIP_MSK, dctrip) ||
@@ -295,7 +307,7 @@ static bool tfa987x_setup_dcdc(struct device *dev, struct regmap *rmap, u16 rev)
 					FIELD_PREP(TFA9874_DCDC_CTRL6_DCVOF_MSK, dcvof));
 
 		if (dcvos)
-			regmap_update_bits(rmap, TFA987X_DCDC_CTRL0,
+			regmap_update_bits(rmap, TFA987X_DCDC_CTRL6,
 					TFA9874_DCDC_CTRL6_DCVOS_MSK,
 					FIELD_PREP(TFA9874_DCDC_CTRL6_DCVOS_MSK, dcvos));
 		break;
@@ -365,9 +377,10 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 	regmap_write(rmap, TFA987X_SYS_CTRL0, TFA987X_SYS_CTRL0_I2CR_MSK);
 
 	/* Setup DC-DC Converter if we have configuration */
+	priv->has_dcdc = tfa987x_setup_dcdc(dev, rmap, rev);
 	regmap_update_bits(rmap, TFA987X_SYS_CTRL0, TFA987X_SYS_CTRL0_DCDC_MSK,
 			   FIELD_PREP(TFA987X_SYS_CTRL0_DCDC_MSK,
-				   (u16) tfa987x_setup_dcdc(dev, rmap, rev)));
+				   (u16) priv->has_dcdc));
 
 	/* Disable DPSA */
 	regmap_update_bits(rmap, TFA987X_AUDIO_CTRL,
@@ -397,10 +410,23 @@ static int tfa987x_i2c_probe(struct i2c_client *i2c)
 				 TFA987X_TDM_CFG6_SPKS_MSK,
 				 FIELD_PREP(TFA987X_TDM_CFG6_SPKS_MSK, channel_index));
 
-	if ((rev & 0xff) == 0x72)
+	if ((rev & 0xff) == 0x72) {
 		regmap_update_bits(rmap, TFA987X_MODE1_DET1,
 				 TFA987X_MODE1_DET1_LPM1MODE_MSK,
 				 FIELD_PREP(TFA987X_MODE1_DET1_LPM1MODE_MSK, 1));
+	} else if ((rev & 0xff) == 0x74) {
+		regmap_update_bits(rmap, TFA987X_AMP_CFG,
+				 TFA987X_AMP_CFG_GAIN_MSK,
+				 FIELD_PREP(TFA987X_AMP_CFG_GAIN_MSK, 0xbe));
+		regmap_update_bits(rmap, TFA987X_TDM_CFG8,
+				 TFA987X_TDM_CFG8_SPKG_MSK |
+				 TFA987X_TDM_CFG8_DCG_MSK,
+				 FIELD_PREP(TFA987X_TDM_CFG8_SPKG_MSK, TFA987X_SPKG_SPEAKER) |
+				 FIELD_PREP(TFA987X_TDM_CFG8_DCG_MSK, 0xf));
+		regmap_update_bits(rmap, TFA987X_MODE1_DET1,
+				 TFA987X_MODE1_DET1_LPM1MODE_MSK,
+				 FIELD_PREP(TFA987X_MODE1_DET1_LPM1MODE_MSK, 2));
+	}
 
 	/* Keep amplifier powered down until DAPM enables its Playback Switch */
 	regmap_update_bits(rmap, TFA987X_SYS_CTRL0,

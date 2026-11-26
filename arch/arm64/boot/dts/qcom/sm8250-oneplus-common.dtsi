@@ -724,6 +724,11 @@
 		reg = <0x34>;
 		reset-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
 		vddd-supply = <&vreg_s4a_1p8>;
+		max-coil-current = <11>;
+		first-boost-voltage = <30>;
+		second-boost-voltage = <63>;
+		first-boost-trip-lvl = <10>;
+		second-boost-trip-lvl = <5>;
 		sound-channel = <0>;
 		sound-name-prefix = "Top Speaker";
 		#sound-dai-cells = <0>;
@@ -734,6 +739,11 @@
 		reg = <0x35>;
 		reset-gpios = <&tlmm 99 GPIO_ACTIVE_HIGH>;
 		vddd-supply = <&vreg_s4a_1p8>;
+		max-coil-current = <10>;
+		first-boost-voltage = <30>;
+		second-boost-voltage = <63>;
+		first-boost-trip-lvl = <10>;
+		second-boost-trip-lvl = <5>;
 		sound-channel = <1>;
 		sound-name-prefix = "Bottom Speaker";
 		#sound-dai-cells = <0>;
