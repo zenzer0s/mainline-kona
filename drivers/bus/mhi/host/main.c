@@ -1179,14 +1179,26 @@ int mhi_process_data_event_ring(struct mhi_controller *mhi_cntrl,
 	return count;
 }
 
+#define MHI_EV_TASK_QUOTA	32
+
 void mhi_ev_task(unsigned long data)
 {
 	struct mhi_event *mhi_event = (struct mhi_event *)data;
 	struct mhi_controller *mhi_cntrl = mhi_event->mhi_cntrl;
+	struct mhi_ring *ev_ring = &mhi_event->ring;
+	dma_addr_t ptr;
+	int ret;
 
-	/* process all pending events */
+	/* Process bounded batches so NET_RX_SOFTIRQ can drain before backlog overflows */
 	spin_lock_bh(&mhi_event->lock);
-	mhi_event->process_event(mhi_cntrl, mhi_event, U32_MAX);
+	ret = mhi_event->process_event(mhi_cntrl, mhi_event, MHI_EV_TASK_QUOTA);
+	if (ret > 0 && mhi_cntrl->mhi_ctxt &&
+	    !MHI_EVENT_ACCESS_INVALID(mhi_cntrl->pm_state)) {
+		ptr = le64_to_cpu(mhi_cntrl->mhi_ctxt->er_ctxt[mhi_event->er_index].rp);
+		if (is_valid_ring_ptr(ev_ring, ptr) &&
+		    ev_ring->rp != mhi_to_virtual(ev_ring, ptr))
+			tasklet_schedule(&mhi_event->task);
+	}
 	spin_unlock_bh(&mhi_event->lock);
 }
 
@@ -1247,6 +1259,58 @@ static bool mhi_is_ring_full(struct mhi_controller *mhi_cntrl,
 	return (tmp == ring->rp);
 }
 
+static int __mhi_gen_tre(struct mhi_controller *mhi_cntrl, struct mhi_chan *mhi_chan,
+			 struct mhi_buf_info *info, enum mhi_flags flags)
+{
+	struct mhi_ring *buf_ring, *tre_ring;
+	struct mhi_ring_element *mhi_tre;
+	struct mhi_buf_info *buf_info;
+	int eot, eob, chain, bei;
+
+	lockdep_assert_held(&mhi_chan->lock);
+
+	if (mhi_chan->ch_state != MHI_CH_STATE_ENABLED)
+		return -ENODEV;
+
+	buf_ring = &mhi_chan->buf_ring;
+	tre_ring = &mhi_chan->tre_ring;
+
+	buf_info = buf_ring->wp;
+	WARN_ON(buf_info->used);
+	buf_info->pre_mapped = info->pre_mapped;
+	if (info->pre_mapped)
+		buf_info->p_addr = info->p_addr;
+	else
+		buf_info->v_addr = info->v_addr;
+	buf_info->cb_buf = info->cb_buf;
+	buf_info->wp = tre_ring->wp;
+	buf_info->dir = mhi_chan->dir;
+	buf_info->len = info->len;
+
+	if (!info->pre_mapped) {
+		int ret = mhi_cntrl->map_single(mhi_cntrl, buf_info);
+		if (ret)
+			return ret;
+	}
+
+	eob = !!(flags & MHI_EOB);
+	eot = !!(flags & MHI_EOT);
+	chain = !!(flags & MHI_CHAIN);
+	bei = !!(mhi_chan->intmod);
+
+	mhi_tre = tre_ring->wp;
+	mhi_tre->ptr = MHI_TRE_DATA_PTR(buf_info->p_addr);
+	mhi_tre->dword[0] = MHI_TRE_DATA_DWORD0(info->len);
+	mhi_tre->dword[1] = MHI_TRE_DATA_DWORD1(bei, eot, eob, chain);
+
+	trace_mhi_gen_tre(mhi_cntrl, mhi_chan, mhi_tre);
+	/* increment WP */
+	mhi_add_ring_element(mhi_cntrl, tre_ring);
+	mhi_add_ring_element(mhi_cntrl, buf_ring);
+
+	return 0;
+}
+
 static int mhi_queue(struct mhi_device *mhi_dev, struct mhi_buf_info *buf_info,
 		     enum dma_data_direction dir, enum mhi_flags mflags)
 {
@@ -1254,21 +1318,31 @@ static int mhi_queue(struct mhi_device *mhi_dev, struct mhi_buf_info *buf_info,
 	struct mhi_chan *mhi_chan = (dir == DMA_TO_DEVICE) ? mhi_dev->ul_chan :
 							     mhi_dev->dl_chan;
 	struct mhi_ring *tre_ring = &mhi_chan->tre_ring;
-	unsigned long flags;
+	unsigned long chan_flags;
 	int ret;
 
 	if (unlikely(MHI_PM_IN_ERROR_STATE(mhi_cntrl->pm_state)))
 		return -EIO;
 
-	ret = mhi_is_ring_full(mhi_cntrl, tre_ring);
-	if (unlikely(ret))
+	/*
+	 * Hold mhi_chan->lock across TRE enqueue + DB update (ordered outside
+	 * pm_lock consistently across MHI) so MHI_EV_CC_OOB setting db_mode
+	 * on another CPU cannot race with mhi_db_brstmode() clearing db_mode.
+	 */
+	write_lock_irqsave(&mhi_chan->lock, chan_flags);
+
+	if (unlikely(mhi_is_ring_full(mhi_cntrl, tre_ring))) {
+		write_unlock_irqrestore(&mhi_chan->lock, chan_flags);
 		return -EAGAIN;
+	}
 
-	ret = mhi_gen_tre(mhi_cntrl, mhi_chan, buf_info, mflags);
-	if (unlikely(ret))
+	ret = __mhi_gen_tre(mhi_cntrl, mhi_chan, buf_info, mflags);
+	if (unlikely(ret)) {
+		write_unlock_irqrestore(&mhi_chan->lock, chan_flags);
 		return ret;
+	}
 
-	read_lock_irqsave(&mhi_cntrl->pm_lock, flags);
+	read_lock(&mhi_cntrl->pm_lock);
 
 	/* Packet is queued, take a usage ref to exit M3 if necessary
 	 * for host->device buffer, balanced put is done on buffer completion
@@ -1288,7 +1362,8 @@ static int mhi_queue(struct mhi_device *mhi_dev, struct mhi_buf_info *buf_info,
 	if (dir == DMA_FROM_DEVICE)
 		mhi_cntrl->runtime_put(mhi_cntrl);
 
-	read_unlock_irqrestore(&mhi_cntrl->pm_lock, flags);
+	read_unlock(&mhi_cntrl->pm_lock);
+	write_unlock_irqrestore(&mhi_chan->lock, chan_flags);
 
 	return ret;
 }
@@ -1314,57 +1389,11 @@ EXPORT_SYMBOL_GPL(mhi_queue_skb);
 int mhi_gen_tre(struct mhi_controller *mhi_cntrl, struct mhi_chan *mhi_chan,
 			struct mhi_buf_info *info, enum mhi_flags flags)
 {
-	struct mhi_ring *buf_ring, *tre_ring;
-	struct mhi_ring_element *mhi_tre;
-	struct mhi_buf_info *buf_info;
-	int eot, eob, chain, bei;
-	int ret = 0;
+	int ret;
 
 	/* Protect accesses for reading and incrementing WP */
 	write_lock_bh(&mhi_chan->lock);
-
-	if (mhi_chan->ch_state != MHI_CH_STATE_ENABLED) {
-		ret = -ENODEV;
-		goto out;
-	}
-
-	buf_ring = &mhi_chan->buf_ring;
-	tre_ring = &mhi_chan->tre_ring;
-
-	buf_info = buf_ring->wp;
-	WARN_ON(buf_info->used);
-	buf_info->pre_mapped = info->pre_mapped;
-	if (info->pre_mapped)
-		buf_info->p_addr = info->p_addr;
-	else
-		buf_info->v_addr = info->v_addr;
-	buf_info->cb_buf = info->cb_buf;
-	buf_info->wp = tre_ring->wp;
-	buf_info->dir = mhi_chan->dir;
-	buf_info->len = info->len;
-
-	if (!info->pre_mapped) {
-		ret = mhi_cntrl->map_single(mhi_cntrl, buf_info);
-		if (ret)
-			goto out;
-	}
-
-	eob = !!(flags & MHI_EOB);
-	eot = !!(flags & MHI_EOT);
-	chain = !!(flags & MHI_CHAIN);
-	bei = !!(mhi_chan->intmod);
-
-	mhi_tre = tre_ring->wp;
-	mhi_tre->ptr = MHI_TRE_DATA_PTR(buf_info->p_addr);
-	mhi_tre->dword[0] = MHI_TRE_DATA_DWORD0(info->len);
-	mhi_tre->dword[1] = MHI_TRE_DATA_DWORD1(bei, eot, eob, chain);
-
-	trace_mhi_gen_tre(mhi_cntrl, mhi_chan, mhi_tre);
-	/* increment WP */
-	mhi_add_ring_element(mhi_cntrl, tre_ring);
-	mhi_add_ring_element(mhi_cntrl, buf_ring);
-
-out:
+	ret = __mhi_gen_tre(mhi_cntrl, mhi_chan, info, flags);
 	write_unlock_bh(&mhi_chan->lock);
 
 	return ret;
@@ -1642,13 +1671,12 @@ static int mhi_prepare_channel(struct mhi_controller *mhi_cntrl,
 			}
 		}
 
-		read_lock_bh(&mhi_cntrl->pm_lock);
-		if (MHI_DB_ACCESS_VALID(mhi_cntrl)) {
-			read_lock_irq(&mhi_chan->lock);
+		write_lock_irq(&mhi_chan->lock);
+		read_lock(&mhi_cntrl->pm_lock);
+		if (MHI_DB_ACCESS_VALID(mhi_cntrl))
 			mhi_ring_chan_db(mhi_cntrl, mhi_chan);
-			read_unlock_irq(&mhi_chan->lock);
-		}
-		read_unlock_bh(&mhi_cntrl->pm_lock);
+		read_unlock(&mhi_cntrl->pm_lock);
+		write_unlock_irq(&mhi_chan->lock);
 	}
 
 	mutex_unlock(&mhi_chan->mutex);

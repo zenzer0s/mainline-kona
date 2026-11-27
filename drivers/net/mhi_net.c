@@ -49,7 +49,7 @@ static int mhi_ndo_open(struct net_device *ndev)
 	struct mhi_net_dev *mhi_netdev = netdev_priv(ndev);
 
 	/* Feed the rx buffer pool */
-	schedule_delayed_work(&mhi_netdev->rx_refill, 0);
+	queue_delayed_work(system_highpri_wq, &mhi_netdev->rx_refill, 0);
 
 	/* Carrier is established via out-of-band channel (e.g. qmi) */
 	netif_carrier_on(ndev);
@@ -228,9 +228,9 @@ static void mhi_net_dl_callback(struct mhi_device *mhi_dev,
 		__netif_rx(skb);
 	}
 
-	/* Refill if RX buffers queue becomes low */
-	if (free_desc_count >= mhi_netdev->rx_queue_sz / 2)
-		schedule_delayed_work(&mhi_netdev->rx_refill, 0);
+	/* Refill proactively before the DL ring drains into modem flow control */
+	if (free_desc_count >= min_t(u32, mhi_netdev->rx_queue_sz / 4, 64))
+		queue_delayed_work(system_highpri_wq, &mhi_netdev->rx_refill, 0);
 }
 
 static void mhi_net_ul_callback(struct mhi_device *mhi_dev,
@@ -272,15 +272,17 @@ static void mhi_net_rx_refill_work(struct work_struct *work)
 	struct net_device *ndev = mhi_netdev->ndev;
 	struct mhi_device *mdev = mhi_netdev->mdev;
 	struct sk_buff *skb;
-	unsigned int size;
-	int err;
+	unsigned int size, queued = 0;
+	int err = 0;
 
 	size = mhi_netdev->mru ? mhi_netdev->mru : READ_ONCE(ndev->mtu);
 
 	while (!mhi_queue_is_full(mdev, DMA_FROM_DEVICE)) {
 		skb = netdev_alloc_skb(ndev, size);
-		if (unlikely(!skb))
+		if (unlikely(!skb)) {
+			err = -ENOMEM;
 			break;
+		}
 
 		err = mhi_queue_skb(mdev, DMA_FROM_DEVICE, skb, size, MHI_EOT);
 		if (unlikely(err)) {
@@ -290,15 +292,20 @@ static void mhi_net_rx_refill_work(struct work_struct *work)
 			break;
 		}
 
-		/* Do not hog the CPU if rx buffers are consumed faster than
-		 * queued (unlikely).
-		 */
-		cond_resched();
+		/* Yield periodically without burning per-buffer resched overhead */
+		if ((++queued & 0xf) == 0)
+			cond_resched();
 	}
 
-	/* If we're still starved of rx buffers, reschedule later */
-	if (mhi_get_free_desc_count(mdev, DMA_FROM_DEVICE) == mhi_netdev->rx_queue_sz)
-		schedule_delayed_work(&mhi_netdev->rx_refill, HZ / 2);
+	/* Retry promptly on transient allocation failure so ring stays fed */
+	if (err == -ENOMEM ||
+	    mhi_get_free_desc_count(mdev, DMA_FROM_DEVICE) == mhi_netdev->rx_queue_sz) {
+		unsigned long delay = err == -ENOMEM ? msecs_to_jiffies(20) : HZ / 2;
+
+		if (err != -EIO && err != -ENODEV)
+			queue_delayed_work(system_highpri_wq, &mhi_netdev->rx_refill,
+					   delay);
+	}
 }
 
 static int mhi_net_newlink(struct mhi_device *mhi_dev, struct net_device *ndev)

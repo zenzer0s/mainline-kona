@@ -580,7 +580,15 @@ static const struct mhi_channel_config mhi_oneplus_sdx55_channels[] = {
 	MHI_CHANNEL_CONFIG_UL(32, "DUN", 32, 0),
 	MHI_CHANNEL_CONFIG_DL(33, "DUN", 32, 0),
 	MHI_CHANNEL_CONFIG_HW_UL(100, "IP_HW0", 128, 2),
-	MHI_CHANNEL_CONFIG_HW_DL(101, "IP_HW0", 128, 3),
+	/* Deepen IP_HW0 DL ring 128->1024 to avoid modem DL flow-control stalls */
+	MHI_CHANNEL_CONFIG_HW_DL(101, "IP_HW0", 1024, 3),
+};
+
+static struct mhi_event_config mhi_oneplus_sdx55_events[] = {
+	MHI_EVENT_CONFIG_CTRL(0, 128),
+	MHI_EVENT_CONFIG_DATA(1, 128),
+	MHI_EVENT_CONFIG_HW_DATA(2, 1024, 100),
+	MHI_EVENT_CONFIG_HW_DATA(3, 2048, 101)
 };
 
 static const struct mhi_controller_config modem_oneplus_sdx55_config = {
@@ -588,8 +596,8 @@ static const struct mhi_controller_config modem_oneplus_sdx55_config = {
 	.timeout_ms = 20000,
 	.num_channels = ARRAY_SIZE(mhi_oneplus_sdx55_channels),
 	.ch_cfg = mhi_oneplus_sdx55_channels,
-	.num_events = ARRAY_SIZE(mhi_foxconn_sdx55_events),
-	.event_cfg = mhi_foxconn_sdx55_events,
+	.num_events = ARRAY_SIZE(mhi_oneplus_sdx55_events),
+	.event_cfg = mhi_oneplus_sdx55_events,
 };
 
 static const struct mhi_pci_dev_info mhi_oneplus_sdx55_info = {
