@@ -1738,7 +1738,7 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			 * enter L1/L1.2 while the modem is idle.
 			 */
 			pm_runtime_forbid(&pdev->dev);
-			pm_runtime_set_autosuspend_delay(&pdev->dev, 5000);
+			pm_runtime_set_autosuspend_delay(&pdev->dev, 2000);
 			pm_runtime_use_autosuspend(&pdev->dev);
 			pm_runtime_mark_last_busy(&pdev->dev);
 			pm_runtime_put_noidle(&pdev->dev);
