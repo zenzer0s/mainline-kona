@@ -911,20 +911,26 @@ static int aw8695_restore_config(struct aw8695_data *haptics)
 static int aw8695_haptics_stop(struct aw8695_data *haptics)
 {
 	int err;
-	unsigned int read_buf;
+	unsigned int read_buf = 0;
 	struct device *dev = &haptics->client->dev;
 
-	err = regmap_update_bits(haptics->regmap, AW8695_GO,
-		AW8695_GO_ENABLE, 0);
+	err = regmap_read(haptics->regmap, AW8695_GLB_STATE, &read_buf);
 	if (err)
 		return err;
 
-	err = regmap_read_poll_timeout(haptics->regmap, AW8695_GLB_STATE, read_buf,
-			(read_buf & 0x0f) == 0, 500, 2000 * 100);
-	if (err) {
-		dev_err(dev, "Did not enter standby: %d, resetting controller\n", err);
-		aw8695_hw_reset(haptics);
-		return aw8695_restore_config(haptics);
+	if ((read_buf & 0x0f) != 0) {
+		err = regmap_update_bits(haptics->regmap, AW8695_GO,
+			AW8695_GO_ENABLE, 0);
+		if (err)
+			return err;
+
+		err = regmap_read_poll_timeout(haptics->regmap, AW8695_GLB_STATE, read_buf,
+				(read_buf & 0x0f) == 0, 500, 2000 * 100);
+		if (err) {
+			dev_err(dev, "Did not enter standby: %d, resetting controller\n", err);
+			aw8695_hw_reset(haptics);
+			return aw8695_restore_config(haptics);
+		}
 	}
 
 	return aw8695_set_work_mode(haptics, AW8695_STANDBY_MODE);
@@ -2169,7 +2175,7 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 		aw8695_set_work_mode(haptics, AW8695_RTP_MODE);
 		regmap_update_bits(haptics->regmap, AW8695_GO,
 				   AW8695_GO_ENABLE, AW8695_GO_ENABLE);
-		usleep_range(2000, 2500);
+		usleep_range(500, 800);
 		if (tmp > (haptics->ram_base_addr ? haptics->ram_base_addr
 						  : AW8695_RAM_BASE_ADDR))
 			aw8695_pm_qos_enable(haptics, true);
@@ -2633,8 +2639,8 @@ static int aw8695_haptic_brightness_set(struct led_classdev *cdev,
 	return err;
 }
 
-static ssize_t state_show(struct device *dev, struct device_attribute *attr,
-			  char *buf)
+static ssize_t oplus_state_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
@@ -2642,8 +2648,9 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%u\n", haptics->state);
 }
 
-static ssize_t state_store(struct device *dev, struct device_attribute *attr,
-			   const char *buf, size_t count)
+static ssize_t oplus_state_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
@@ -2658,8 +2665,8 @@ static ssize_t state_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
-static ssize_t duration_show(struct device *dev, struct device_attribute *attr,
-			     char *buf)
+static ssize_t oplus_duration_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
@@ -2672,8 +2679,9 @@ static ssize_t duration_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%u\n", haptics->duration);
 }
 
-static ssize_t duration_store(struct device *dev, struct device_attribute *attr,
-			      const char *buf, size_t count)
+static ssize_t oplus_duration_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
@@ -2688,8 +2696,8 @@ static ssize_t duration_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
-static ssize_t activate_show(struct device *dev, struct device_attribute *attr,
-			     char *buf)
+static ssize_t oplus_activate_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
@@ -2697,8 +2705,9 @@ static ssize_t activate_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%u\n", haptics->state);
 }
 
-static ssize_t activate_store(struct device *dev, struct device_attribute *attr,
-			      const char *buf, size_t count)
+static ssize_t oplus_activate_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
@@ -3059,9 +3068,9 @@ static ssize_t lra_resistance_show(struct device *dev,
 	return sysfs_emit(buf, "%u\n", haptics->lra_resistance);
 }
 
-static DEVICE_ATTR_RW(state);
-static DEVICE_ATTR_RW(duration);
-static DEVICE_ATTR_RW(activate);
+static DEVICE_ATTR_RW(oplus_state);
+static DEVICE_ATTR_RW(oplus_duration);
+static DEVICE_ATTR_RW(oplus_activate);
 static DEVICE_ATTR_RW(vmax);
 static DEVICE_ATTR_RW(gain);
 static DEVICE_ATTR_RW(waveform_index);
@@ -3076,9 +3085,9 @@ static DEVICE_ATTR_RO(vbat_monitor);
 static DEVICE_ATTR_RO(lra_resistance);
 
 static struct attribute *aw8695_vibrator_attrs[] = {
-	&dev_attr_state.attr,
-	&dev_attr_duration.attr,
-	&dev_attr_activate.attr,
+	&dev_attr_oplus_state.attr,
+	&dev_attr_oplus_duration.attr,
+	&dev_attr_oplus_activate.attr,
 	&dev_attr_vmax.attr,
 	&dev_attr_gain.attr,
 	&dev_attr_waveform_index.attr,
