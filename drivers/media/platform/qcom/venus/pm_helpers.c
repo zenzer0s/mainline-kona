@@ -984,7 +984,15 @@ static int core_get_v4(struct venus_core *core)
 	if (legacy_binding)
 		return 0;
 
-	ret = devm_pm_opp_set_clkname(dev, "core");
+	/*
+	 * On SM8250 (IRIS2), "core" (video_cc_mvs0c_clk, /2 divider: 360/507/
+	 * 549/666 MHz) and "vcodec0_core" (video_cc_mvs0_clk, /3 divider:
+	 * 240/338/366/444 MHz) share video_cc_mvs0_clk_src, while the DT OPP
+	 * table and sm8250_freq_table specify the /3 vcodec0_core rates.
+	 * Binding OPP to "core" causes clk_round_rate(366 MHz) -> 507 MHz ->
+	 * -ERANGE, pinning Venus at 240 MHz even during 4K decode.
+	 */
+	ret = devm_pm_opp_set_clkname(dev, IS_IRIS2(core) ? "vcodec0_core" : "core");
 	if (ret)
 		return ret;
 
