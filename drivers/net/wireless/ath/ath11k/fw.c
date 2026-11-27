@@ -157,6 +157,19 @@ int ath11k_fw_pre_init(struct ath11k_base *ab)
 
 	ab->fw.api_version = 1;
 
+	/*
+	 * Cache standalone amss.bin in memory at boot so MHI never calls
+	 * request_firmware() from dpm_resume_early() or recovery while
+	 * storage/userspace are suspended.
+	 */
+	ab->fw.fw = ath11k_core_firmware_request(ab, ATH11K_AMSS_FILE);
+	if (IS_ERR(ab->fw.fw)) {
+		ab->fw.fw = NULL;
+	} else {
+		ab->fw.amss_data = ab->fw.fw->data;
+		ab->fw.amss_len = ab->fw.fw->size;
+	}
+
 out:
 	ath11k_dbg(ab, ATH11K_DBG_BOOT, "using fw api %d\n",
 		   ab->fw.api_version);

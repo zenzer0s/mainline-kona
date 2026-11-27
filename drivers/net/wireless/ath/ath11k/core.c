@@ -2662,6 +2662,15 @@ int ath11k_core_init(struct ath11k_base *ab)
 	dmi_id = dmi_first_match(ath11k_pm_quirk_table);
 	if (dmi_id)
 		ab->pm_policy = (kernel_ulong_t)dmi_id->driver_data;
+	else if (ab->hw_rev == ATH11K_HW_QCA6390_HW20 &&
+		 of_machine_is_compatible("qcom,sm8250"))
+		/*
+		 * Keep QCA6390 in MHI M3 (WoW) across s2idle even when Wi-Fi
+		 * is off instead of powering down in suspend_late and trying
+		 * to cold-boot/request_firmware() in dpm_resume_early before
+		 * UFS resumes (which deadlocks resume and trips APSS WDT).
+		 */
+		ab->pm_policy = ATH11K_PM_WOW;
 	else
 		ab->pm_policy = ATH11K_PM_DEFAULT;
 
