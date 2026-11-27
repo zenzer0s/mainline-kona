@@ -2149,10 +2149,22 @@ static int swclk_gate_enable(struct clk_hw *hw)
 	struct regmap *regmap = tx->regmap;
 	int ret;
 
+	ret = clk_prepare_enable(tx->macro);
+	if (ret) {
+		dev_err(tx->dev, "failed to enable macro\n");
+		return ret;
+	}
+
+	ret = clk_prepare_enable(tx->dcodec);
+	if (ret) {
+		dev_err(tx->dev, "failed to enable dcodec\n");
+		goto err_dcodec;
+	}
+
 	ret = clk_prepare_enable(tx->mclk);
 	if (ret) {
 		dev_err(tx->dev, "failed to enable mclk\n");
-		return ret;
+		goto err_mclk;
 	}
 
 	tx_macro_mclk_enable(tx, true);
@@ -2161,6 +2173,11 @@ static int swclk_gate_enable(struct clk_hw *hw)
 			   CDC_TX_SWR_CLK_EN_MASK,
 			   CDC_TX_SWR_CLK_ENABLE);
 	return 0;
+err_mclk:
+	clk_disable_unprepare(tx->dcodec);
+err_dcodec:
+	clk_disable_unprepare(tx->macro);
+	return ret;
 }
 
 static void swclk_gate_disable(struct clk_hw *hw)
@@ -2173,6 +2190,8 @@ static void swclk_gate_disable(struct clk_hw *hw)
 
 	tx_macro_mclk_enable(tx, false);
 	clk_disable_unprepare(tx->mclk);
+	clk_disable_unprepare(tx->dcodec);
+	clk_disable_unprepare(tx->macro);
 }
 
 static int swclk_gate_is_enabled(struct clk_hw *hw)
@@ -2390,11 +2409,14 @@ static void tx_macro_remove(struct platform_device *pdev)
 {
 	struct tx_macro *tx = dev_get_drvdata(&pdev->dev);
 
-	clk_disable_unprepare(tx->macro);
-	clk_disable_unprepare(tx->dcodec);
-	clk_disable_unprepare(tx->mclk);
-	clk_disable_unprepare(tx->npl);
-	clk_disable_unprepare(tx->fsgen);
+	pm_runtime_disable(&pdev->dev);
+	if (!pm_runtime_status_suspended(&pdev->dev)) {
+		clk_disable_unprepare(tx->fsgen);
+		clk_disable_unprepare(tx->npl);
+		clk_disable_unprepare(tx->mclk);
+		clk_disable_unprepare(tx->dcodec);
+		clk_disable_unprepare(tx->macro);
+	}
 
 	lpass_macro_pds_exit(tx->pds);
 }
@@ -2409,6 +2431,8 @@ static int tx_macro_runtime_suspend(struct device *dev)
 	clk_disable_unprepare(tx->fsgen);
 	clk_disable_unprepare(tx->npl);
 	clk_disable_unprepare(tx->mclk);
+	clk_disable_unprepare(tx->dcodec);
+	clk_disable_unprepare(tx->macro);
 
 	return 0;
 }
@@ -2418,10 +2442,22 @@ static int tx_macro_runtime_resume(struct device *dev)
 	struct tx_macro *tx = dev_get_drvdata(dev);
 	int ret;
 
+	ret = clk_prepare_enable(tx->macro);
+	if (ret) {
+		dev_err(dev, "unable to prepare macro\n");
+		return ret;
+	}
+
+	ret = clk_prepare_enable(tx->dcodec);
+	if (ret) {
+		dev_err(dev, "unable to prepare dcodec\n");
+		goto err_dcodec;
+	}
+
 	ret = clk_prepare_enable(tx->mclk);
 	if (ret) {
 		dev_err(dev, "unable to prepare mclk\n");
-		return ret;
+		goto err_mclk;
 	}
 
 	ret = clk_prepare_enable(tx->npl);
@@ -2444,6 +2480,10 @@ err_fsgen:
 	clk_disable_unprepare(tx->npl);
 err_npl:
 	clk_disable_unprepare(tx->mclk);
+err_mclk:
+	clk_disable_unprepare(tx->dcodec);
+err_dcodec:
+	clk_disable_unprepare(tx->macro);
 
 	return ret;
 }
