@@ -2618,9 +2618,14 @@ static int aw8695_haptic_brightness_set(struct led_classdev *cdev,
 	struct aw8695_data *haptics = container_of(cdev, struct aw8695_data, cdev);
 	int err = 0;
 
+	if (level > 0)
+		aw8695_pm_qos_enable(haptics, true);
+
 	mutex_lock(&haptics->lock);
 	if (haptics->haptic_rtp_mode) {
 		mutex_unlock(&haptics->lock);
+		if (level > 0)
+			aw8695_pm_qos_enable(haptics, false);
 		return 0;
 	}
 
@@ -2638,6 +2643,9 @@ static int aw8695_haptic_brightness_set(struct led_classdev *cdev,
 						 AW8695_GO_ENABLE);
 	}
 	mutex_unlock(&haptics->lock);
+
+	if (level > 0)
+		aw8695_pm_qos_enable(haptics, false);
 	return err;
 }
 
