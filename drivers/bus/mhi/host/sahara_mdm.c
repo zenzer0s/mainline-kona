@@ -594,6 +594,11 @@ static int sahara_send_mem_read(struct sahara_context *context, u64 addr, u64 le
 			     le32_to_cpu(context->cmd->length), MHI_EOT);
 }
 
+static bool collect_ramdump;
+module_param(collect_ramdump, bool, 0644);
+MODULE_PARM_DESC(collect_ramdump,
+		 "Collect SDX55 Sahara crash ramdump via devcoredump instead of immediately resetting");
+
 /* MEMORY_DEBUG (32-bit), as sent by the SDX55 remotefs_sahara EFS sync */
 static void sahara_memory_debug(struct sahara_context *context)
 {
@@ -604,6 +609,13 @@ static void sahara_memory_debug(struct sahara_context *context)
 		 le32_to_cpu(context->rx->length),
 		 le32_to_cpu(context->rx->memory_debug.table_address),
 		 le32_to_cpu(context->rx->memory_debug.table_length));
+
+	if (!context->is_efs && !collect_ramdump) {
+		dev_warn(&context->mhi_dev->dev,
+			 "SDX55 entered Sahara ramdump mode; skipping dump and resetting modem\n");
+		sahara_send_reset(context);
+		return;
+	}
 
 	if (le32_to_cpu(context->rx->length) != SAHARA_MEM_DEBUG_LENGTH) {
 		dev_err(&context->mhi_dev->dev, "Malformed memory debug packet - length %d\n",
@@ -667,6 +679,13 @@ static void sahara_memory_debug64(struct sahara_context *context)
 		le32_to_cpu(context->rx->length),
 		le64_to_cpu(context->rx->memory_debug64.table_address),
 		le64_to_cpu(context->rx->memory_debug64.table_length));
+
+	if (!context->is_efs && !collect_ramdump) {
+		dev_warn(&context->mhi_dev->dev,
+			 "SDX55 entered Sahara ramdump mode; skipping dump and resetting modem\n");
+		sahara_send_reset(context);
+		return;
+	}
 
 	if (le32_to_cpu(context->rx->length) != SAHARA_MEM_DEBUG64_LENGTH) {
 		dev_err(&context->mhi_dev->dev, "Malformed memory debug64 packet - length %d\n",

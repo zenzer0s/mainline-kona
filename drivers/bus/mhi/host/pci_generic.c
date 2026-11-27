@@ -1242,6 +1242,52 @@ static void mhi_pci_start(struct mhi_pci_device *mhi_pdev);
 static bool mhi_pci_is_alive(struct mhi_controller *mhi_cntrl);
 
 /*
+ * Disable upstream Root Port AER reporting and Surprise Down / Completion
+ * Timeout for flashless SDX55 on SM8250 PCIe2. A Root Port Secondary Bus
+ * Reset triggered by aerdrv on an intentional SoC/Sahara reset or modem crash
+ * always times out after 65 s and wedges 0002:01:00.0; MHI recovery_work
+ * handles link/config restoration instead.
+ */
+static void mhi_pci_disable_rp_aer(struct pci_dev *pdev)
+{
+#ifdef CONFIG_PCIEAER
+	struct pci_dev *bridge = pci_upstream_bridge(pdev);
+	int br_aer = bridge ? bridge->aer_cap : 0;
+	u32 val = 0;
+
+	if (br_aer) {
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_ROOT_COMMAND, &val);
+		val &= ~(PCI_ERR_ROOT_CMD_COR_EN |
+			 PCI_ERR_ROOT_CMD_NONFATAL_EN |
+			 PCI_ERR_ROOT_CMD_FATAL_EN);
+		pci_write_config_dword(bridge, br_aer + PCI_ERR_ROOT_COMMAND, val);
+
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK, &val);
+		val |= PCI_ERR_UNC_SURPDN | PCI_ERR_UNC_COMP_TIME;
+		pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK, val);
+
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_UNCOR_STATUS, &val);
+		if (val)
+			pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_STATUS, val);
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_COR_STATUS, &val);
+		if (val)
+			pci_write_config_dword(bridge, br_aer + PCI_ERR_COR_STATUS, val);
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_ROOT_STATUS, &val);
+		if (val)
+			pci_write_config_dword(bridge, br_aer + PCI_ERR_ROOT_STATUS, val);
+	}
+	if (pdev->aer_cap) {
+		pci_read_config_dword(pdev, pdev->aer_cap + PCI_ERR_UNCOR_STATUS, &val);
+		if (val)
+			pci_write_config_dword(pdev, pdev->aer_cap + PCI_ERR_UNCOR_STATUS, val);
+		pci_read_config_dword(pdev, pdev->aer_cap + PCI_ERR_COR_STATUS, &val);
+		if (val)
+			pci_write_config_dword(pdev, pdev->aer_cap + PCI_ERR_COR_STATUS, val);
+	}
+#endif
+}
+
+/*
  * Issue an intentional SoC reset on the flashless SDX55 while masking
  * upstream Root Port AER reporting / Surprise Down so aerdrv does not
  * fire a competing Secondary Bus Reset that wedges 0002:01:00.0 in D3cold.
@@ -1251,26 +1297,16 @@ static void mhi_pci_soc_reset_quiet(struct mhi_pci_device *mhi_pdev)
 	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
 	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
 	unsigned long deadline;
-#ifdef CONFIG_PCIEAER
-	struct pci_dev *bridge = pci_upstream_bridge(pdev);
-	int br_aer = bridge ? bridge->aer_cap : 0;
-	u32 br_root_cmd = 0, br_uncor_mask = 0, status = 0;
 
-	if (br_aer) {
-		pci_read_config_dword(bridge, br_aer + PCI_ERR_ROOT_COMMAND,
-				      &br_root_cmd);
-		pci_write_config_dword(bridge, br_aer + PCI_ERR_ROOT_COMMAND,
-				       br_root_cmd & ~(PCI_ERR_ROOT_CMD_COR_EN |
-						       PCI_ERR_ROOT_CMD_NONFATAL_EN |
-						       PCI_ERR_ROOT_CMD_FATAL_EN));
-		pci_read_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK,
-				      &br_uncor_mask);
-		pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK,
-				       br_uncor_mask | PCI_ERR_UNC_SURPDN);
-	}
-#endif
+	mhi_pci_disable_rp_aer(pdev);
 
-	mhi_soc_reset(mhi_cntrl);
+	/*
+	 * If the modem is still responsive (e.g. stuck in AMSS/SBL), trigger
+	 * an SoC reset; if it already dropped the link (e.g. SAHARA_RESET_CMD),
+	 * just wait for it to re-enumerate in PBL.
+	 */
+	if (mhi_pci_is_alive(mhi_cntrl))
+		mhi_soc_reset(mhi_cntrl);
 	msleep(MHI_POST_RESET_DELAY_MS);
 
 	deadline = jiffies + msecs_to_jiffies(3000);
@@ -1283,29 +1319,7 @@ static void mhi_pci_soc_reset_quiet(struct mhi_pci_device *mhi_pdev)
 	if (pci_enable_device(pdev) == 0)
 		pci_set_master(pdev);
 
-#ifdef CONFIG_PCIEAER
-	if (br_aer) {
-		pci_read_config_dword(bridge, br_aer + PCI_ERR_UNCOR_STATUS, &status);
-		if (status)
-			pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_STATUS, status);
-		pci_read_config_dword(bridge, br_aer + PCI_ERR_COR_STATUS, &status);
-		if (status)
-			pci_write_config_dword(bridge, br_aer + PCI_ERR_COR_STATUS, status);
-		pci_read_config_dword(bridge, br_aer + PCI_ERR_ROOT_STATUS, &status);
-		if (status)
-			pci_write_config_dword(bridge, br_aer + PCI_ERR_ROOT_STATUS, status);
-		pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK, br_uncor_mask);
-		pci_write_config_dword(bridge, br_aer + PCI_ERR_ROOT_COMMAND, br_root_cmd);
-	}
-	if (pdev->aer_cap) {
-		pci_read_config_dword(pdev, pdev->aer_cap + PCI_ERR_UNCOR_STATUS, &status);
-		if (status)
-			pci_write_config_dword(pdev, pdev->aer_cap + PCI_ERR_UNCOR_STATUS, status);
-		pci_read_config_dword(pdev, pdev->aer_cap + PCI_ERR_COR_STATUS, &status);
-		if (status)
-			pci_write_config_dword(pdev, pdev->aer_cap + PCI_ERR_COR_STATUS, status);
-	}
-#endif
+	mhi_pci_disable_rp_aer(pdev);
 }
 
 static void mhi_pci_fw_wait(struct work_struct *work)
@@ -1449,6 +1463,13 @@ static void mhi_pci_status_cb(struct mhi_controller *mhi_cntrl,
 		dev_warn(&pdev->dev, "firmware crashed (%u)\n", cb);
 		if (!mhi_pdev->no_m3)
 			pm_runtime_forbid(&pdev->dev);
+		if (mhi_pdev->poll_irqs && mhi_pdev->sbl_reset_retries < 4) {
+			mhi_pdev->sbl_reset_retries++;
+			dev_warn(&pdev->dev,
+				 "scheduling SDX55 recovery (%u/4)\n",
+				 mhi_pdev->sbl_reset_retries);
+			queue_work(system_long_wq, &mhi_pdev->recovery_work);
+		}
 		break;
 	case MHI_CB_IDLE:
 		if (!mhi_pdev->no_m3) {
@@ -1458,6 +1479,8 @@ static void mhi_pci_status_cb(struct mhi_controller *mhi_cntrl,
 		break;
 	case MHI_CB_EE_MISSION_MODE:
 		cancel_delayed_work(&mhi_pdev->boot_dbg_work);
+		mhi_pdev->sbl_stall_count = 0;
+		mhi_pdev->sbl_reset_retries = 0;
 		/* downstream mhi,sfr-support: have the X55 report its crash reason */
 		if (of_machine_is_compatible("oneplus,kebab")) {
 			int ret = mhi_setup_sfr(mhi_cntrl, 256);
@@ -1897,6 +1920,7 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			mhi_pci_map_msi_sink(mhi_pdev, pdev);
 		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
 		pci_d3cold_disable(pdev);
+		mhi_pci_disable_rp_aer(pdev);
 		device_wakeup_enable(&pdev->dev);
 		mhi_pdev->poll_irqs = true;
 		mhi_pdev->fw_waiting = true;
