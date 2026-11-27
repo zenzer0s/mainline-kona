@@ -153,7 +153,12 @@ void mhi_ring_chan_db(struct mhi_controller *mhi_cntrl,
 enum mhi_ee_type mhi_get_exec_env(struct mhi_controller *mhi_cntrl)
 {
 	u32 exec;
-	int ret = mhi_read_reg(mhi_cntrl, mhi_cntrl->bhi, BHI_EXECENV, &exec);
+	int ret;
+
+	if (!mhi_cntrl->bhi)
+		return MHI_EE_MAX;
+
+	ret = mhi_read_reg(mhi_cntrl, mhi_cntrl->bhi, BHI_EXECENV, &exec);
 
 	return (ret) ? MHI_EE_MAX : exec;
 }
@@ -162,8 +167,13 @@ EXPORT_SYMBOL_GPL(mhi_get_exec_env);
 enum mhi_state mhi_get_mhi_state(struct mhi_controller *mhi_cntrl)
 {
 	u32 state;
-	int ret = mhi_read_reg_field(mhi_cntrl, mhi_cntrl->regs, MHISTATUS,
-				     MHISTATUS_MHISTATE_MASK, &state);
+	int ret;
+
+	if (!mhi_cntrl->regs)
+		return MHI_STATE_MAX;
+
+	ret = mhi_read_reg_field(mhi_cntrl, mhi_cntrl->regs, MHISTATUS,
+				 MHISTATUS_MHISTATE_MASK, &state);
 	return ret ? MHI_STATE_MAX : state;
 }
 EXPORT_SYMBOL_GPL(mhi_get_mhi_state);
