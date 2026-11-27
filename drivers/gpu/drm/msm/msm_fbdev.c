@@ -5,6 +5,9 @@
  */
 
 #include <linux/fb.h>
+#include <linux/io.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_crtc_helper.h>
@@ -88,6 +91,53 @@ static const struct drm_fb_helper_funcs msm_fbdev_helper_funcs = {
 	.fb_dirty = msm_fbdev_fb_dirty,
 };
 
+static void msm_fbdev_copy_boot_splash(struct drm_framebuffer *fb, void *vaddr, int pitch)
+{
+	struct device_node *np, *mem_np;
+	struct resource res;
+	const char *format;
+	u32 width, height, stride, y;
+	void *splash;
+	int ret;
+
+	np = of_find_compatible_node(NULL, NULL, "simple-framebuffer");
+	if (!np)
+		return;
+
+	ret = of_address_to_resource(np, 0, &res);
+	if (ret) {
+		mem_np = of_parse_phandle(np, "memory-region", 0);
+		if (!mem_np)
+			goto out;
+		ret = of_address_to_resource(mem_np, 0, &res);
+		of_node_put(mem_np);
+		if (ret)
+			goto out;
+	}
+
+	if (of_property_read_u32(np, "width", &width) ||
+	    of_property_read_u32(np, "height", &height) ||
+	    of_property_read_u32(np, "stride", &stride) ||
+	    of_property_read_string(np, "format", &format))
+		goto out;
+
+	if (width != fb->width || height != fb->height || fb->format->cpp[0] != 4 ||
+	    (strcmp(format, "a8r8g8b8") && strcmp(format, "x8r8g8b8")) ||
+	    (u64)stride * height > resource_size(&res))
+		goto out;
+
+	splash = memremap(res.start, (size_t)stride * height, MEMREMAP_WC);
+	if (!splash)
+		goto out;
+
+	for (y = 0; y < height; y++)
+		memcpy(vaddr + y * pitch, splash + y * stride, width * 4);
+
+	memunmap(splash);
+out:
+	of_node_put(np);
+}
+
 int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 				 struct drm_fb_helper_surface_size *sizes)
 {
@@ -144,6 +194,8 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 	}
 	fbi->screen_size = bo->size;
 	fbi->fix.smem_start = paddr;
+
+	msm_fbdev_copy_boot_splash(fb, fbi->screen_buffer, pitch);
 	fbi->fix.smem_len = bo->size;
 
 	DBG("par=%p, %dx%d", fbi->par, fbi->var.xres, fbi->var.yres);

@@ -14,6 +14,7 @@
 #include <drm/drm_mode_config.h>
 #include <drm/drm_vblank.h>
 #include <drm/clients/drm_client_setup.h>
+#include <drm/drm_fb_helper.h>
 
 #include "disp/msm_disp_snapshot.h"
 #include "msm_drv.h"
@@ -385,4 +386,7 @@ void msm_drm_kms_post_init(struct device *dev)
 
 	drm_kms_helper_poll_init(ddev);
 	drm_client_setup(ddev, NULL);
+
+	if (IS_ENABLED(CONFIG_DRM_FBDEV_EMULATION) && ddev->fb_helper)
+		drm_fb_helper_restore_fbdev_mode_unlocked(ddev->fb_helper);
 }
