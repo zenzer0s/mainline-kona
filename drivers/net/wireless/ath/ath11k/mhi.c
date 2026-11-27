@@ -483,13 +483,22 @@ int ath11k_mhi_suspend(struct ath11k_pci *ab_pci)
 int ath11k_mhi_resume(struct ath11k_pci *ab_pci)
 {
 	struct ath11k_base *ab = ab_pci->ab;
+	unsigned int saved_timeout = ab_pci->mhi_ctrl->timeout_ms;
 	int ret;
+
+	/*
+	 * Bound M3->M0 resume wait to 2 s (normal exit takes <5 ms) so a
+	 * missed QCA6390 wakeup triggers clean mac80211 recovery instead of
+	 * blocking dpm_resume() for 20 s and tripping the APSS watchdog.
+	 */
+	ab_pci->mhi_ctrl->timeout_ms = min(saved_timeout, 2000U);
 
 	/* Do force MHI resume as some devices like QCA6390, WCN6855
 	 * are not in M3 state but they are functional. So just ignore
 	 * the MHI state while resuming.
 	 */
 	ret = mhi_pm_resume_force(ab_pci->mhi_ctrl);
+	ab_pci->mhi_ctrl->timeout_ms = saved_timeout;
 	if (ret) {
 		ath11k_warn(ab, "failed to resume mhi: %d", ret);
 		return ret;

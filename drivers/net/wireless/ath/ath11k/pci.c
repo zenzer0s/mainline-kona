@@ -1008,6 +1008,16 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
 		switch (soc_hw_version_major) {
 		case 2:
 			ab->hw_rev = ATH11K_HW_QCA6390_HW20;
+			/*
+			 * Stock SM8250 cnss2 sets no_d3hot on QCA6390: parking
+			 * 0000:01:00.0 in PCIe D3hot across rapid s2idle cycles
+			 * can wedge MHI in M3 on resume. Keep D0 so MHI M3 and
+			 * hardware PCIe0 ASPM L1.1/L1.2 handle sleep cleanly.
+			 */
+			if (of_machine_is_compatible("qcom,sm8250")) {
+				pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+				pci_d3cold_disable(pdev);
+			}
 			break;
 		default:
 			dev_err(&pdev->dev, "Unsupported QCA6390 SOC hardware version: %d %d\n",
@@ -1227,6 +1237,7 @@ static void ath11k_pci_shutdown(struct pci_dev *pdev)
 
 static __maybe_unused int ath11k_pci_pm_suspend(struct device *dev)
 {
+	struct pci_dev *pdev = to_pci_dev(dev);
 	struct ath11k_base *ab = dev_get_drvdata(dev);
 	int ret;
 
@@ -1238,6 +1249,14 @@ static __maybe_unused int ath11k_pci_pm_suspend(struct device *dev)
 	ret = ath11k_core_suspend(ab);
 	if (ret)
 		ath11k_warn(ab, "failed to suspend core: %d\n", ret);
+
+	/*
+	 * Save PCI state while remaining in D0 so pci_pm_suspend_noirq() skips
+	 * pci_prepare_to_sleep(D3hot) and keeps both endpoint and root port in
+	 * D0 with MHI M3 + ASPM L1.1/L1.2 active across s2idle.
+	 */
+	if (pdev->dev_flags & PCI_DEV_FLAGS_NO_D3)
+		pci_save_state(pdev);
 
 	return 0;
 }
