@@ -9,6 +9,7 @@
 #include <linux/platform_device.h>
 #include <linux/clk-provider.h>
 #include <linux/interconnect-clk.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset-controller.h>
 #include <linux/of.h>
@@ -321,6 +322,12 @@ static void qcom_cc_clk_regs_configure(struct device *dev, const struct qcom_cc_
 		data->clk_regs_configure(dev, regmap);
 }
 
+static void qcom_cc_sync_state(struct device *dev)
+{
+	clk_sync_state(dev);
+	of_genpd_sync_state(dev->of_node);
+}
+
 int qcom_cc_really_probe(struct device *dev,
 			 const struct qcom_cc_desc *desc, struct regmap *regmap)
 {
@@ -372,6 +379,14 @@ int qcom_cc_really_probe(struct device *dev,
 		goto put_rpm;
 
 	if (desc->gdscs && desc->num_gdscs) {
+		/*
+		 * gdsc_register() -> of_genpd_add_provider_onecell() installs
+		 * genpd_sync_state as the driver's sync_state callback, which
+		 * makes clk_core_hold_state() hold every boot-enabled clock
+		 * until clk_sync_state() runs. Register a combined callback
+		 * first so both held clocks and GDSCs are released on sync.
+		 */
+		dev_set_drv_sync_state(dev, qcom_cc_sync_state);
 		scd = devm_kzalloc(dev, sizeof(*scd), GFP_KERNEL);
 		if (!scd) {
 			ret = -ENOMEM;

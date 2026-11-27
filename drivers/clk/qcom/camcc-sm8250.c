@@ -1462,7 +1462,7 @@ static struct clk_branch cam_cc_gdsc_clk = {
 				&cam_cc_xo_clk_src.clkr.hw
 			},
 			.num_parents = 1,
-			.flags = CLK_IS_CRITICAL | CLK_SET_RATE_PARENT,
+			.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_PARENT,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -2444,6 +2444,9 @@ static int cam_cc_sm8250_probe(struct platform_device *pdev)
 	clk_zonda_pll_configure(&cam_cc_pll2, regmap, &cam_cc_pll2_config);
 	clk_lucid_pll_configure(&cam_cc_pll3, regmap, &cam_cc_pll3_config);
 	clk_lucid_pll_configure(&cam_cc_pll4, regmap, &cam_cc_pll4_config);
+
+	/* Keep GDSC clock enabled in hardware without holding camcc rpm active */
+	qcom_branch_set_clk_en(regmap, 0xc16c); /* CAM_CC_GDSC_CLK */
 
 	ret = qcom_cc_really_probe(&pdev->dev, &cam_cc_sm8250_desc, regmap);
 
