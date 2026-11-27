@@ -3,6 +3,7 @@
  * Copyright (c) 2026, The Linux Foundation.
  */
 
+#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 #include "sm8250-oneplus-common.dtsi"
 
 / {
@@ -183,13 +184,15 @@
 					trip = <&skin_trip0>;
 					cooling-device = <&gpu 2 2>,
 							 <&cpu4 7 7>,
-							 <&cpu7 8 8>;
+							 <&cpu7 8 8>,
+							 <&mp2650_charger 1 1>;
 				};
 
 				map1 {
 					trip = <&skin_trip1>;
 					cooling-device = <&cpu4 9 9>,
-							 <&cpu7 11 11>;
+							 <&cpu7 11 11>,
+							 <&mp2650_charger 2 2>;
 				};
 
 				map2 {
@@ -197,7 +200,8 @@
 					cooling-device = <&gpu 4 4>,
 							 <&cpu0 3 3>,
 							 <&cpu4 14 14>,
-							 <&cpu7 15 15>;
+							 <&cpu7 15 15>,
+							 <&mp2650_charger 3 3>;
 				};
 
 				map3 {
@@ -205,7 +209,8 @@
 					cooling-device = <&gpu 5 5>,
 							 <&cpu0 10 10>,
 							 <&cpu4 16 16>,
-							 <&cpu7 18 18>;
+							 <&cpu7 18 18>,
+							 <&mp2650_charger 5 5>;
 				};
 			};
 		};
@@ -219,10 +224,10 @@
 };
 
 &battery {
-	/* Dual-cell 2S pack (2x 2250 mAh in series, 8.70 V max, 19.575 Wh) */
+	/* Dual-cell 2S pack (2x 2250 mAh in series, 8.875 V max / 4.4375 V per cell, 19.575 Wh) */
 	charge-full-design-microamp-hours = <2250000>;
 	energy-full-design-microwatt-hours = <19575000>;
-	voltage-max-design-microvolt = <8700000>;
+	voltage-max-design-microvolt = <8875000>;
 };
 
 &cdsp {
@@ -388,14 +393,23 @@
 
 	status = "okay";
 
-	charger@5c {
+	mp2650_charger: charger@5c {
 		compatible = "mps,mp2650";
 		reg = <0x5c>;
 		monitored-battery = <&battery>;
-		constant-charge-voltage-max-microvolt = <8700000>;
+		constant-charge-voltage-max-microvolt = <8875000>;
 		constant-charge-current-max-microamp = <3000000>;
 		input-current-limit-microamp = <3000000>;
 		otg-enable-gpios = <&pm8150_gpios 3 GPIO_ACTIVE_HIGH>;
+		pinctrl-0 = <&mps_otg_en_default>;
+		pinctrl-names = "default";
+		#cooling-cells = <2>;
+
+		mp2650_otg_vbus: usb-otg-vbus {
+			regulator-name = "mp2650-otg-vbus";
+			regulator-min-microvolt = <5000000>;
+			regulator-max-microvolt = <5000000>;
+		};
 	};
 };
 
@@ -440,15 +454,37 @@
 	pins = "gpio24";
 };
 
+&pm8150_gpios {
+	mps_otg_en_default: mps-otg-en-default-state {
+		pins = "gpio3";
+		function = "normal";
+		bias-disable;
+		power-source = <0>;
+		output-low;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_LOW>;
+	};
+};
+
 &pm8150b_typec {
+	/* 2S kebab supplies 5V OTG VBUS from external MP2650, not PM8150B internal boost */
+	vdd-vbus-supply = <&mp2650_otg_vbus>;
+
 	connector {
 		op-sink-microwatt = <27000000>;
+		source-pdos = <PDO_FIXED(5000, 1000,
+			       PDO_FIXED_DUAL_ROLE |
+			       PDO_FIXED_USB_COMM |
+			       PDO_FIXED_DATA_SWAP)>;
 		sink-pdos = <PDO_FIXED(5000, 3000,
 			     PDO_FIXED_DUAL_ROLE |
 			     PDO_FIXED_USB_COMM |
 			     PDO_FIXED_DATA_SWAP)>,
 			    <PDO_FIXED(9000, 3000, 0)>;
 	};
+};
+
+&pm8150b_vbus {
+	status = "disabled";
 };
 
 &pm8150_adc {
@@ -836,6 +872,9 @@
 /* Optical fingerprint sensor supply (stock drives pm8150_l16 at 3.3V) */
 &vreg_l16a_2p7 {
 	regulator-max-microvolt = <3304000>;
+	regulator-allow-set-load;
+	regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+				   RPMH_REGULATOR_MODE_HPM>;
 };
 
 &wcd938x {

@@ -575,6 +575,7 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			.x = 540,
 			.y = 1897,
 		};
+		gf_set_vdd_lpm(gf_dev, false);
 		sendnlmsg_tp(GF_NET_EVENT_TP_TOUCHDOWN, &tp_info);
 		break;
 	}
@@ -587,6 +588,8 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			.y = 1897,
 		};
 		sendnlmsg_tp(GF_NET_EVENT_TP_TOUCHUP, &tp_info);
+		if (gf_dev->fb_black)
+			gf_set_vdd_lpm(gf_dev, true);
 		break;
 	}
 
@@ -721,7 +724,13 @@ void gf_notify_screen_state(bool on)
 	if (gf_dev->device_available != 1)
 		return;
 	gf_dev->fb_black = on ? 0 : 1;
-	sendnlmsg(&msg);
+	if (on) {
+		gf_set_vdd_lpm(gf_dev, false);
+		sendnlmsg(&msg);
+	} else {
+		sendnlmsg(&msg);
+		gf_set_vdd_lpm(gf_dev, true);
+	}
 #endif
 }
 EXPORT_SYMBOL_GPL(gf_notify_screen_state);

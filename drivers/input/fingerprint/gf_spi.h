@@ -172,6 +172,7 @@ void gf_cleanup(struct gf_dev *gf_dev);
 
 int gf_power_on(struct gf_dev *gf_dev);
 int gf_power_off(struct gf_dev *gf_dev);
+int gf_set_vdd_lpm(struct gf_dev *gf_dev, bool lpm);
 
 int gf_hw_reset(struct gf_dev *gf_dev, unsigned int delay_ms);
 int gf_power_reset(struct gf_dev *gf_dev);

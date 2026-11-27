@@ -166,6 +166,14 @@ err_reg:
 	return rc;
 }
 
+int gf_set_vdd_lpm(struct gf_dev *gf_dev, bool lpm)
+{
+	if (IS_ERR_OR_NULL(gf_dev->vdd) || !gf_dev->vdd_on)
+		return 0;
+
+	return regulator_set_load(gf_dev->vdd, lpm ? 1000 : 150000);
+}
+
 int gf_power_off(struct gf_dev *gf_dev)
 {
 	int rc = 0;
