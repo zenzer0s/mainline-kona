@@ -520,6 +520,8 @@
 #define RICHTAP_UPDATE_RAM			_IO(RICHTAP_IOCTL_GROUP, 0x10)
 #define RICHTAP_GET_F0				_IO(RICHTAP_IOCTL_GROUP, 0x11)
 #define RICHTAP_STOP_MODE			_IO(RICHTAP_IOCTL_GROUP, 0x12)
+/* Atomic F0-locked SRAM playback: arg = wav[6:0] | gain[15:8] | bst_vol[20:16] */
+#define RICHTAP_PLAY_SRAM			_IO(RICHTAP_IOCTL_GROUP, 0x20)
 
 #define RICHTAP_MMAP_BUF_SIZE			1000
 #define RICHTAP_MMAP_PAGE_ORDER			2
@@ -1664,6 +1666,8 @@ static irqreturn_t aw8695_irq(int irq, void *data)
  * ========================================================================= */
 
 static int aw8695_ram_update(struct aw8695_data *haptics);
+static int aw8695_haptic_set_wav_seq(struct aw8695_data *haptics, u8 idx, u8 wav);
+static int aw8695_haptic_set_wav_loop(struct aw8695_data *haptics, u8 idx, u8 loop);
 
 static void aw8695_pm_qos_enable(struct aw8695_data *haptics, bool enable)
 {
@@ -2219,6 +2223,54 @@ out_rtp:
 		mutex_unlock(&haptics->lock);
 		mutex_unlock(&haptics->ioctl_lock);
 		return 0;
+
+	case RICHTAP_PLAY_SRAM: {
+		u8 wav = arg & 0x7f;
+		u8 gain = (arg >> 8) & 0xff;
+		u8 bst_vol = (arg >> 16) & 0x1f;
+
+		if (!wav)
+			return -EINVAL;
+		if (!gain || gain > AW8695_HAPTIC_DEFAULT_GAIN)
+			gain = AW8695_HAPTIC_DEFAULT_GAIN;
+		if (!bst_vol || bst_vol > AW8695_HAPTIC_HIGH_VMAX_REG)
+			bst_vol = AW8695_HAPTIC_HIGH_VMAX_REG;
+
+		mutex_lock(&haptics->ioctl_lock);
+		atomic_set(&haptics->done_flag, 1);
+		aw8695_richtap_clean_buf(haptics, MMAP_BUF_DATA_FINISHED);
+		cancel_work_sync(&haptics->haptic_rtp_work);
+
+		aw8695_pm_qos_enable(haptics, true);
+		mutex_lock(&haptics->lock);
+		haptics->haptic_rtp_mode = false;
+		aw8695_haptic_set_rtp_aei(haptics, false);
+		aw8695_haptics_stop(haptics);
+
+		haptics->gain = gain;
+		haptics->vmax = bst_vol;
+		ret = aw8695_haptic_set_wav_seq(haptics, 0, wav);
+		if (!ret)
+			ret = aw8695_haptic_set_wav_seq(haptics, 1, 0);
+		if (!ret)
+			ret = aw8695_haptic_set_wav_loop(haptics, 0, 0);
+		if (!ret)
+			ret = aw8695_richtap_set_osc_clock(haptics, false);
+		if (!ret)
+			ret = aw8695_haptic_set_gain(haptics, gain);
+		if (!ret)
+			ret = aw8695_haptic_set_bst_vol(haptics, bst_vol);
+		if (!ret)
+			ret = aw8695_set_work_mode(haptics, AW8695_RAM_MODE);
+		if (!ret)
+			ret = regmap_update_bits(haptics->regmap, AW8695_GO,
+						 AW8695_GO_ENABLE,
+						 AW8695_GO_ENABLE);
+		mutex_unlock(&haptics->lock);
+		aw8695_pm_qos_enable(haptics, false);
+		mutex_unlock(&haptics->ioctl_lock);
+		return ret;
+	}
 
 	default:
 		dev_dbg(dev, "RichTap unsupported ioctl: 0x%x\n", cmd);
