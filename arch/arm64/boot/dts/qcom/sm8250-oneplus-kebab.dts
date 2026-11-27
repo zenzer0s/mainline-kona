@@ -861,3 +861,12 @@
 	 */
 	snps,msi-target-in-ram;
 };
+
+/*
+ * QCE hardware crypto driver (CONFIG_CRYPTO_DEV_QCE) is not used on kebab
+ * (ARMv8 CE and UFS ICE handle crypto); disable the node so its interconnect
+ * suppliers (aggre2_noc, mc_virt) are not blocked from running icc_sync_state().
+ */
+&crypto {
+	status = "disabled";
+};
