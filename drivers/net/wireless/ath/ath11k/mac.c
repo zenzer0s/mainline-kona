@@ -4850,6 +4850,9 @@ static int ath11k_station_disassoc(struct ath11k *ar,
 	}
 
 	ret = ath11k_clear_peer_keys(arvif, sta->addr);
+	if (ret == -ENOENT && ar->ab->hw_params.single_pdev_only &&
+	    arvif->vdev_type == WMI_VDEV_TYPE_AP)
+		return 0;
 	if (ret) {
 		ath11k_warn(ar->ab, "failed to clear all peer keys for vdev %i: %d\n",
 			    arvif->vdev_id, ret);
@@ -9623,6 +9626,68 @@ err_fallback:
 	return 0;
 }
 
+/**
+ * ath11k_mac_evict_roamed_ap_peer - Remove stale firmware peer on another VDEV
+ * @ar: Target radio (caller holds @ar->conf_mutex)
+ * @new_arvif: Destination AP VIF where the STA is associating
+ * @addr: Station MAC address
+ *
+ * Single-pdev hardware such as QCA6390 crashes (ERRCODE 0x9 / MHI_CB_EE_RDDM)
+ * when WMI_PEER_CREATE_CMDID is sent for a MAC that still has an active peer on
+ * another AP VDEV (e.g. band-steering between 2.4 GHz and 5 GHz on dual-band
+ * bridged SoftAP before hostapd removes the old entry). Clean up the previous
+ * VDEV's keys, DP state, and firmware peer first.
+ */
+static void ath11k_mac_evict_roamed_ap_peer(struct ath11k *ar,
+					    struct ath11k_vif *new_arvif,
+					    const u8 *addr)
+{
+	struct ath11k_base *ab = ar->ab;
+	struct ath11k_vif *old_arvif = NULL, *tmp;
+	struct ath11k_peer *peer;
+	int old_vdev_id = -1;
+	int ret;
+
+	lockdep_assert_held(&ar->conf_mutex);
+
+	if (!ab->hw_params.single_pdev_only ||
+	    new_arvif->vdev_type != WMI_VDEV_TYPE_AP)
+		return;
+
+	spin_lock_bh(&ab->base_lock);
+	list_for_each_entry(peer, &ab->peers, list) {
+		if (peer->vdev_id != new_arvif->vdev_id && peer->sta &&
+		    ether_addr_equal(peer->addr, addr)) {
+			old_vdev_id = peer->vdev_id;
+			break;
+		}
+	}
+	spin_unlock_bh(&ab->base_lock);
+
+	if (old_vdev_id < 0)
+		return;
+
+	spin_lock_bh(&ar->data_lock);
+	list_for_each_entry(tmp, &ar->arvifs, list) {
+		if (tmp->vdev_id == old_vdev_id &&
+		    tmp->vdev_type == WMI_VDEV_TYPE_AP) {
+			old_arvif = tmp;
+			break;
+		}
+	}
+	spin_unlock_bh(&ar->data_lock);
+
+	if (!old_arvif)
+		return;
+
+	ath11k_clear_peer_keys(old_arvif, addr);
+	ath11k_dp_peer_cleanup(ar, old_vdev_id, addr);
+	ret = ath11k_peer_delete(ar, old_vdev_id, (u8 *)addr);
+	ath11k_dbg(ab, ATH11K_DBG_MAC,
+		   "evicted roamed peer %pM from vdev %d before adding to vdev %d (ret %d)\n",
+		   addr, old_vdev_id, new_arvif->vdev_id, ret);
+}
+
 static int ath11k_mac_station_add(struct ath11k *ar,
 				  struct ieee80211_vif *vif,
 				  struct ieee80211_sta *sta)
@@ -9634,6 +9699,8 @@ static int ath11k_mac_station_add(struct ath11k *ar,
 	int ret;
 
 	lockdep_assert_held(&ar->conf_mutex);
+
+	ath11k_mac_evict_roamed_ap_peer(ar, arvif, sta->addr);
 
 	ret = ath11k_mac_inc_num_stations(arvif, sta);
 	if (ret) {
@@ -9738,7 +9805,8 @@ static int ath11k_mac_station_remove(struct ath11k *ar,
 {
 	struct ath11k_base *ab = ar->ab;
 	struct ath11k_vif *arvif = ath11k_vif_to_arvif(vif);
-	int ret;
+	bool peer_exists;
+	int ret = 0;
 
 	if (ab->hw_params.vdev_start_delay &&
 	    arvif->is_started &&
@@ -9750,15 +9818,25 @@ static int ath11k_mac_station_remove(struct ath11k *ar,
 		}
 	}
 
-	ath11k_dp_peer_cleanup(ar, arvif->vdev_id, sta->addr);
+	spin_lock_bh(&ab->base_lock);
+	peer_exists = !!ath11k_peer_find(ab, arvif->vdev_id, sta->addr);
+	spin_unlock_bh(&ab->base_lock);
 
-	ret = ath11k_peer_delete(ar, arvif->vdev_id, sta->addr);
-	if (ret)
-		ath11k_warn(ab, "Failed to delete peer: %pM for VDEV: %d\n",
-			    sta->addr, arvif->vdev_id);
-	else
-		ath11k_dbg(ab, ATH11K_DBG_MAC, "Removed peer: %pM for VDEV: %d\n",
+	if (peer_exists) {
+		ath11k_dp_peer_cleanup(ar, arvif->vdev_id, sta->addr);
+
+		ret = ath11k_peer_delete(ar, arvif->vdev_id, sta->addr);
+		if (ret)
+			ath11k_warn(ab, "Failed to delete peer: %pM for VDEV: %d\n",
+				    sta->addr, arvif->vdev_id);
+		else
+			ath11k_dbg(ab, ATH11K_DBG_MAC, "Removed peer: %pM for VDEV: %d\n",
+				   sta->addr, arvif->vdev_id);
+	} else {
+		ath11k_dbg(ab, ATH11K_DBG_MAC,
+			   "Peer %pM already removed from VDEV %d\n",
 			   sta->addr, arvif->vdev_id);
+	}
 
 	ath11k_mac_dec_num_stations(arvif, sta);
 	ath11k_mac_station_cleanup(sta);

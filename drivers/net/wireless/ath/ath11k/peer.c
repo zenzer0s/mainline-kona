@@ -310,11 +310,10 @@ static int __ath11k_peer_delete(struct ath11k *ar, u32 vdev_id, const u8 *addr)
 	if (peer && peer->vdev_id == vdev_id)
 		ath11k_peer_rhash_delete(ab, peer);
 
-	/* Fallback to peer list search if the correct peer can't be found.
-	 * Skip the deletion of the peer from the rhash since it has already
-	 * been deleted in peer add.
+	/* Fallback to peer list search if the correct peer can't be found,
+	 * including when rhash points to another vdev_id.
 	 */
-	if (!peer)
+	if (!peer || peer->vdev_id != vdev_id)
 		peer = ath11k_peer_find(ab, vdev_id, addr);
 
 	if (!peer) {
