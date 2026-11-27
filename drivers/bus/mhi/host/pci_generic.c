@@ -11,6 +11,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/firmware.h>
+#include <linux/interrupt.h>
 #include <linux/iommu.h>
 #include <linux/mhi.h>
 #include <linux/module.h>
@@ -623,6 +624,16 @@ static const struct mhi_pci_dev_info mhi_oneplus_sdx55_info = {
 	 */
 	.mru_default = 31744,
 	.sideband_wake = false,
+	/*
+	 * Stock SM8250+SDX55 sets no_d3hot and never parks the modem in PCIe
+	 * D3hot/M3: on SM8250 PCIe2, PME never fires from D3hot and WAKE#
+	 * stays high, so device-initiated traffic (GNSS QMI_LOC indications,
+	 * incoming calls/SMS/data) stalls until a host TX wakes the link, and
+	 * ~60 s of blocked modem TX triggers a fatal PCIe AER SDES link drop.
+	 * Keep the endpoint in D0 so MHI uses autonomous M2 + hardware ASPM L1
+	 * and GICv3 MBI MSIs wake the AP cleanly from s2idle.
+	 */
+	.no_m3 = true,
 	.reset_on_remove = true,
 };
 
@@ -1108,7 +1119,9 @@ struct mhi_pci_device {
 	struct work_struct recovery_work;
 	struct timer_list health_check_timer;
 	unsigned long status;
+	bool no_m3;
 	bool reset_on_remove;
+	u32 wake_irq_mask;
 	/* bring-up: periodic dump of a flashless modem's boot progress */
 	struct delayed_work boot_dbg_work;
 	unsigned int boot_dbg_left;
@@ -1360,6 +1373,9 @@ static void mhi_pci_write_reg(struct mhi_controller *mhi_cntrl,
 static void mhi_pci_status_cb(struct mhi_controller *mhi_cntrl,
 			      enum mhi_callback cb)
 {
+	struct mhi_pci_device *mhi_pdev = container_of(mhi_cntrl,
+						       struct mhi_pci_device,
+						       mhi_cntrl);
 	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
 
 	/* Nothing to do for now */
@@ -1367,17 +1383,16 @@ static void mhi_pci_status_cb(struct mhi_controller *mhi_cntrl,
 	case MHI_CB_FATAL_ERROR:
 	case MHI_CB_SYS_ERROR:
 		dev_warn(&pdev->dev, "firmware crashed (%u)\n", cb);
-		pm_runtime_forbid(&pdev->dev);
+		if (!mhi_pdev->no_m3)
+			pm_runtime_forbid(&pdev->dev);
 		break;
 	case MHI_CB_IDLE:
-		pm_runtime_mark_last_busy(&pdev->dev);
-		pm_request_autosuspend(&pdev->dev);
+		if (!mhi_pdev->no_m3) {
+			pm_runtime_mark_last_busy(&pdev->dev);
+			pm_request_autosuspend(&pdev->dev);
+		}
 		break;
-	case MHI_CB_EE_MISSION_MODE: {
-		struct mhi_pci_device *mhi_pdev = container_of(mhi_cntrl,
-							       struct mhi_pci_device,
-							       mhi_cntrl);
-
+	case MHI_CB_EE_MISSION_MODE:
 		cancel_delayed_work(&mhi_pdev->boot_dbg_work);
 		/* downstream mhi,sfr-support: have the X55 report its crash reason */
 		if (of_machine_is_compatible("oneplus,kebab")) {
@@ -1386,9 +1401,9 @@ static void mhi_pci_status_cb(struct mhi_controller *mhi_cntrl,
 			if (ret)
 				dev_warn(&pdev->dev, "SFR setup failed: %d\n", ret);
 		}
-		pm_runtime_allow(&pdev->dev);
+		if (!mhi_pdev->no_m3)
+			pm_runtime_allow(&pdev->dev);
 		break;
-	}
 	default:
 		break;
 	}
@@ -1532,7 +1547,8 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 	if (!pdev->is_virtfn)
 		timer_delete(&mhi_pdev->health_check_timer);
 
-	pm_runtime_forbid(&pdev->dev);
+	if (!mhi_pdev->no_m3)
+		pm_runtime_forbid(&pdev->dev);
 
 	/* Clean up MHI state */
 	if (test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
@@ -1757,8 +1773,19 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	mhi_cntrl->mru = info->mru_default;
 	mhi_cntrl->name = info->name;
 
+	mhi_pdev->no_m3 = info->no_m3;
 	if (!pdev->is_virtfn)
 		mhi_pdev->reset_on_remove = info->reset_on_remove;
+
+	if (info == &mhi_oneplus_sdx55_info) {
+		/*
+		 * Request MHI MSIs without IRQF_NO_SUSPEND so enable_irq_wake()
+		 * arms IRQD_WAKEUP_ARMED across s2idle: incoming modem MSIs
+		 * wake the AP and run after qcom_pcie_resume_noirq() restores
+		 * the CPU-PCIe interconnect.
+		 */
+		mhi_cntrl->irq_flags = IRQF_SHARED;
+	}
 
 	if (info->edl_trigger)
 		mhi_cntrl->edl_trigger = mhi_pci_generic_edl_trigger;
@@ -1810,22 +1837,9 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 		if (!has_msi_parent)
 			mhi_pci_map_msi_sink(mhi_pdev, pdev);
-		if (pci_pme_capable(pdev, PCI_D3hot)) {
-			device_wakeup_enable(&pdev->dev);
-			if (pdev->bus && pdev->bus->self)
-				device_wakeup_enable(&pdev->bus->self->dev);
-			/*
-			 * Hold runtime PM off until MHI reaches Mission Mode
-			 * (MHI_CB_EE_MISSION_MODE calls pm_runtime_allow()),
-			 * then allow autosuspend into M3/D3hot (250 ms, matching
-			 * stock MHI_RPM_SUSPEND_TMR_MS) so PCIe2 can enter L1.2.
-			 */
-			pm_runtime_forbid(&pdev->dev);
-			pm_runtime_set_autosuspend_delay(&pdev->dev, 250);
-			pm_runtime_use_autosuspend(&pdev->dev);
-			pm_runtime_mark_last_busy(&pdev->dev);
-			pm_runtime_put_noidle(&pdev->dev);
-		}
+		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+		pci_d3cold_disable(pdev);
+		device_wakeup_enable(&pdev->dev);
 		mhi_pdev->poll_irqs = true;
 		mhi_pdev->fw_waiting = true;
 		mhi_pdev->fw_wait_left = 240;	/* 2 min, every 500 ms */
@@ -1882,7 +1896,7 @@ static void mhi_pci_remove(struct pci_dev *pdev)
 	}
 
 	/* balancing probe put_noidle */
-	if (pci_pme_capable(pdev, PCI_D3hot))
+	if (pci_pme_capable(pdev, PCI_D3hot) && !mhi_pdev->no_m3)
 		pm_runtime_get_noresume(&pdev->dev);
 
 	if (mhi_pdev->reset_on_remove)
@@ -2106,13 +2120,63 @@ err_recovery:
 
 static int  __maybe_unused mhi_pci_suspend(struct device *dev)
 {
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mhi_pci_device *mhi_pdev = dev_get_drvdata(dev);
+	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
+	int i;
+
+	if (mhi_pdev->no_m3) {
+		if (!pdev->is_virtfn)
+			timer_delete_sync(&mhi_pdev->health_check_timer);
+
+		mhi_pdev->wake_irq_mask = 0;
+		if (test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) &&
+		    mhi_cntrl->ee == MHI_EE_AMSS &&
+		    device_may_wakeup(dev)) {
+			for (i = 0; i < mhi_cntrl->nr_irqs && i < 32; i++) {
+				if (!enable_irq_wake(mhi_cntrl->irq[i]))
+					mhi_pdev->wake_irq_mask |= BIT(i);
+			}
+		}
+
+		/*
+		 * Save PCI state while staying in D0 so pci_pm_suspend_noirq()
+		 * skips pci_prepare_to_sleep() and keeps both the endpoint and
+		 * root port in D0 with ASPM L1 + MHI M2 active across s2idle.
+		 */
+		pci_save_state(pdev);
+		return 0;
+	}
+
 	pm_runtime_disable(dev);
 	return mhi_pci_runtime_suspend(dev);
 }
 
 static int __maybe_unused mhi_pci_resume(struct device *dev)
 {
-	int ret;
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mhi_pci_device *mhi_pdev = dev_get_drvdata(dev);
+	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
+	int ret, i;
+
+	if (mhi_pdev->no_m3) {
+		for (i = 0; i < mhi_cntrl->nr_irqs && i < 32; i++) {
+			if (mhi_pdev->wake_irq_mask & BIT(i))
+				disable_irq_wake(mhi_cntrl->irq[i]);
+		}
+		mhi_pdev->wake_irq_mask = 0;
+
+		if (!pdev->is_virtfn &&
+		    test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
+			unsigned long period = (mhi_pdev->poll_irqs &&
+						mhi_cntrl->ee == MHI_EE_AMSS) ?
+					       30 * HZ : HEALTH_CHECK_PERIOD;
+			mod_timer(&mhi_pdev->health_check_timer,
+				  jiffies + period);
+		}
+
+		return 0;
+	}
 
 	/* Depending the platform, device may have lost power (d3cold), we need
 	 * to resume it now to check its state and recover when necessary.

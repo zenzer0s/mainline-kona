@@ -38,6 +38,8 @@ static struct irq_chip mbi_irq_chip = {
 	.irq_eoi		= irq_chip_eoi_parent,
 	.irq_set_type		= irq_chip_set_type_parent,
 	.irq_set_affinity	= irq_chip_set_affinity_parent,
+	.irq_set_wake		= irq_chip_set_wake_parent,
+	.flags			= IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int mbi_irq_gic_domain_alloc(struct irq_domain *domain,
@@ -171,6 +173,7 @@ static bool mbi_init_dev_msi_info(struct device *dev, struct irq_domain *domain,
 	case DOMAIN_BUS_PCI_DEVICE_MSI:
 	case DOMAIN_BUS_PCI_DEVICE_MSIX:
 		info->chip->irq_compose_msi_msg = mbi_compose_msi_msg;
+		info->chip->flags |= IRQCHIP_SKIP_SET_WAKE;
 		return true;
 
 	case DOMAIN_BUS_DEVICE_MSI:
