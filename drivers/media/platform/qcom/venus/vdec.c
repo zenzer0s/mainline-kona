@@ -375,10 +375,15 @@ static int vdec_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 
 	inst->width = format.fmt.pix_mp.width;
 	inst->height = format.fmt.pix_mp.height;
-	inst->crop.top = 0;
-	inst->crop.left = 0;
-	inst->crop.width = inst->width;
-	inst->crop.height = inst->height;
+	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE ||
+	    !inst->crop.width || !inst->crop.height ||
+	    inst->crop.left + inst->crop.width > inst->width ||
+	    inst->crop.top + inst->crop.height > inst->height) {
+		inst->crop.top = 0;
+		inst->crop.left = 0;
+		inst->crop.width = inst->width;
+		inst->crop.height = inst->height;
+	}
 
 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
 		inst->fmt_out = fmt;
