@@ -278,7 +278,8 @@ static void mhi_net_rx_refill_work(struct work_struct *work)
 	size = mhi_netdev->mru ? mhi_netdev->mru : READ_ONCE(ndev->mtu);
 
 	while (!mhi_queue_is_full(mdev, DMA_FROM_DEVICE)) {
-		skb = netdev_alloc_skb(ndev, size);
+		/* Process-context workqueue: avoid GFP_ATOMIC pool pressure */
+		skb = __netdev_alloc_skb(ndev, size, GFP_KERNEL | __GFP_NOWARN);
 		if (unlikely(!skb)) {
 			err = -ENOMEM;
 			break;

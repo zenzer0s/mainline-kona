@@ -865,6 +865,8 @@
 /* X55 handshake lines, as on Sony edo (same SM8250 + SDX55 wiring) */
 &pcie2 {
 	pinctrl-0 = <&pcie2_default_state &ap2mdm_active>;
+	/* Stock kona-pcie.dtsi configures WAKE# (gpio87) active-low with pull-up */
+	wake-gpios = <&tlmm 87 GPIO_ACTIVE_LOW>;
 	msi-parent = <&intc>;
 };
 

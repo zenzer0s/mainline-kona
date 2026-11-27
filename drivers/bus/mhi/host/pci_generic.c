@@ -14,6 +14,7 @@
 #include <linux/iommu.h>
 #include <linux/mhi.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
@@ -616,7 +617,12 @@ static const struct mhi_pci_dev_info mhi_oneplus_sdx55_info = {
 	 * error right after we programmed a 4 GB one.
 	 */
 	.dma_data_width = 30,
-	.mru_default = 32768,
+	/*
+	 * 31 KiB (31744 B) + NET_SKB_PAD (64 B) + skb_shared_info (320 B) fits
+	 * inside a 32 KiB (order-3) slab instead of rounding 32768 B up to
+	 * 64 KiB (order-4), halving the 1024-entry DL ring footprint to 32 MiB.
+	 */
+	.mru_default = 31744,
 	.sideband_wake = false,
 	.reset_on_remove = true,
 };
@@ -1123,7 +1129,111 @@ struct mhi_pci_device {
 	/* scratch page mapped at the MSI address in the device's IOMMU domain */
 	struct page *msi_sink;
 	unsigned long msi_sink_iova;
+	/* dynamic PCIe link speed scaling (MHI_CB_BW_REQ + Gen1 in M3/idle) */
+	struct work_struct bw_scale_work;
+	struct mutex bw_lock;
+	u16 target_link_speed;
+	u16 max_link_speed;
+	bool bw_scale_en;
 };
+
+static int mhi_pci_set_link_speed(struct mhi_pci_device *mhi_pdev, u16 target_speed)
+{
+	struct pci_dev *pdev = to_pci_dev(mhi_pdev->mhi_cntrl.cntrl_dev);
+	struct pci_dev *rp;
+	unsigned long deadline;
+	u16 lnksta = 0, cur_speed;
+	int ret;
+
+	if (!mhi_pdev->bw_scale_en)
+		return 0;
+
+	rp = pcie_find_root_port(pdev);
+	if (!rp)
+		return -ENODEV;
+
+	if (target_speed < PCI_EXP_LNKSTA_CLS_2_5GB)
+		target_speed = PCI_EXP_LNKSTA_CLS_2_5GB;
+	if (mhi_pdev->max_link_speed && target_speed > mhi_pdev->max_link_speed)
+		target_speed = mhi_pdev->max_link_speed;
+
+	ret = pcie_capability_read_word(rp, PCI_EXP_LNKSTA, &lnksta);
+	if (ret)
+		return ret;
+
+	cur_speed = lnksta & PCI_EXP_LNKSTA_CLS;
+	if (cur_speed == target_speed)
+		return 0;
+
+	ret = pcie_capability_clear_and_set_word(rp, PCI_EXP_LNKCTL2,
+						 PCI_EXP_LNKCTL2_TLS,
+						 target_speed);
+	if (ret)
+		return ret;
+
+	ret = pcie_capability_set_word(rp, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_RL);
+	if (ret)
+		return ret;
+
+	deadline = jiffies + msecs_to_jiffies(50);
+	do {
+		usleep_range(500, 1000);
+		ret = pcie_capability_read_word(rp, PCI_EXP_LNKSTA, &lnksta);
+		if (ret)
+			return ret;
+		if (!(lnksta & PCI_EXP_LNKSTA_LT))
+			break;
+	} while (time_before(jiffies, deadline));
+
+	if (lnksta & PCI_EXP_LNKSTA_LT) {
+		dev_warn_ratelimited(&pdev->dev,
+				     "PCIe link retrain timeout (Gen%u -> Gen%u)\n",
+				     cur_speed, target_speed);
+		return -ETIMEDOUT;
+	}
+
+	cur_speed = lnksta & PCI_EXP_LNKSTA_CLS;
+	if (cur_speed != target_speed) {
+		dev_dbg(&pdev->dev,
+			"PCIe link speed settled at Gen%u (requested Gen%u)\n",
+			cur_speed, target_speed);
+		return -EIO;
+	}
+
+	if (target_speed == PCI_EXP_LNKSTA_CLS_2_5GB)
+		dev_info_once(&pdev->dev,
+			      "PCIe link dynamic scaling active (switched to Gen1)\n");
+
+	return 0;
+}
+
+static void mhi_pci_bw_scale_work(struct work_struct *work)
+{
+	struct mhi_pci_device *mhi_pdev = container_of(work, struct mhi_pci_device,
+						       bw_scale_work);
+	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
+	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
+	u16 target;
+
+	/*
+	 * Non-blocking RPM check: if runtime suspend is already in progress or
+	 * active, skip scaling now; runtime_resume will apply target_link_speed.
+	 */
+	if (pm_runtime_get_if_active(&pdev->dev) <= 0)
+		return;
+
+	mutex_lock(&mhi_pdev->bw_lock);
+	if (test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) &&
+	    !test_bit(MHI_PCI_DEV_SUSPENDED, &mhi_pdev->status) &&
+	    mhi_cntrl->ee == MHI_EE_AMSS) {
+		target = READ_ONCE(mhi_pdev->target_link_speed);
+		mhi_pci_set_link_speed(mhi_pdev, target);
+	}
+	mutex_unlock(&mhi_pdev->bw_lock);
+
+	pm_runtime_mark_last_busy(&pdev->dev);
+	pm_runtime_put_autosuspend(&pdev->dev);
+}
 
 /*
  * Some of the X55's MSIs (in SBL) are not terminated by the DWC iMSI-RX and
@@ -1368,6 +1478,21 @@ static void mhi_pci_status_cb(struct mhi_controller *mhi_cntrl,
 		pm_runtime_mark_last_busy(&pdev->dev);
 		pm_request_autosuspend(&pdev->dev);
 		break;
+	case MHI_CB_BW_REQ: {
+		struct mhi_pci_device *mhi_pdev = container_of(mhi_cntrl,
+							       struct mhi_pci_device,
+							       mhi_cntrl);
+		u16 speed = mhi_cntrl->mhi_link_info.target_link_speed;
+
+		if (mhi_pdev->bw_scale_en && speed) {
+			dev_info_once(&pdev->dev,
+				      "MHI_CB_BW_REQ received (target Gen%u x%u)\n",
+				      speed, mhi_cntrl->mhi_link_info.target_link_width);
+			WRITE_ONCE(mhi_pdev->target_link_speed, speed);
+			queue_work(system_wq, &mhi_pdev->bw_scale_work);
+		}
+		break;
+	}
 	case MHI_CB_EE_MISSION_MODE: {
 		struct mhi_pci_device *mhi_pdev = container_of(mhi_cntrl,
 							       struct mhi_pci_device,
@@ -1521,6 +1646,7 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 
 	dev_warn(&pdev->dev, "device recovery started\n");
 
+	cancel_work_sync(&mhi_pdev->bw_scale_work);
 	cancel_delayed_work_sync(&mhi_pdev->poll_work);
 	cancel_delayed_work_sync(&mhi_pdev->boot_dbg_work);
 
@@ -1720,6 +1846,8 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -ENOMEM;
 
 	INIT_WORK(&mhi_pdev->recovery_work, mhi_pci_recovery_work);
+	INIT_WORK(&mhi_pdev->bw_scale_work, mhi_pci_bw_scale_work);
+	mutex_init(&mhi_pdev->bw_lock);
 	INIT_DELAYED_WORK(&mhi_pdev->boot_dbg_work, mhi_pci_boot_dbg);
 	INIT_DELAYED_WORK(&mhi_pdev->fw_wait_work, mhi_pci_fw_wait);
 	INIT_DELAYED_WORK(&mhi_pdev->poll_work, mhi_pci_poll);
@@ -1805,6 +1933,20 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 		if (!has_msi_parent)
 			mhi_pci_map_msi_sink(mhi_pdev, pdev);
+		{
+			struct pci_dev *rp = pcie_find_root_port(pdev);
+			u32 lnkcap = 0;
+			u16 lnksta = 0;
+
+			if (rp && !pcie_capability_read_dword(rp, PCI_EXP_LNKCAP, &lnkcap) &&
+			    !pcie_capability_read_word(rp, PCI_EXP_LNKSTA, &lnksta)) {
+				mhi_pdev->max_link_speed = lnkcap & PCI_EXP_LNKCAP_SLS;
+				mhi_pdev->target_link_speed = lnksta & PCI_EXP_LNKSTA_CLS;
+				if (!mhi_pdev->target_link_speed)
+					mhi_pdev->target_link_speed = mhi_pdev->max_link_speed;
+				mhi_pdev->bw_scale_en = true;
+			}
+		}
 		if (pci_pme_capable(pdev, PCI_D3hot)) {
 			device_wakeup_enable(&pdev->dev);
 			if (pdev->bus && pdev->bus->self)
@@ -1864,6 +2006,7 @@ static void mhi_pci_remove(struct pci_dev *pdev)
 	if (!pdev->is_virtfn)
 		timer_delete_sync(&mhi_pdev->health_check_timer);
 	cancel_work_sync(&mhi_pdev->recovery_work);
+	cancel_work_sync(&mhi_pdev->bw_scale_work);
 	cancel_delayed_work_sync(&mhi_pdev->fw_wait_work);
 	cancel_delayed_work_sync(&mhi_pdev->poll_work);
 	cancel_delayed_work_sync(&mhi_pdev->boot_dbg_work);
@@ -2028,6 +2171,16 @@ static int  __maybe_unused mhi_pci_runtime_suspend(struct device *dev)
 		return -EBUSY;
 	}
 
+	/*
+	 * Drop PCIe link speed to Gen1 (2.5 GT/s) while parked in M3/D3hot,
+	 * matching stock mhi_arch_drv_suspend() to cut idle SerDes/PHY power.
+	 */
+	if (mhi_pdev->bw_scale_en) {
+		mutex_lock(&mhi_pdev->bw_lock);
+		mhi_pci_set_link_speed(mhi_pdev, PCI_EXP_LNKSTA_CLS_2_5GB);
+		mutex_unlock(&mhi_pdev->bw_lock);
+	}
+
 pci_suspend:
 	if (mhi_pdev->poll_irqs) {
 		WRITE_ONCE(mhi_pdev->poll_paused, true);
@@ -2059,6 +2212,14 @@ static int __maybe_unused mhi_pci_runtime_resume(struct device *dev)
 	if (!test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status) ||
 			mhi_cntrl->ee != MHI_EE_AMSS)
 		return 0; /* Nothing to do at MHI level */
+
+	if (mhi_pdev->bw_scale_en) {
+		u16 target = READ_ONCE(mhi_pdev->target_link_speed);
+
+		mutex_lock(&mhi_pdev->bw_lock);
+		mhi_pci_set_link_speed(mhi_pdev, target);
+		mutex_unlock(&mhi_pdev->bw_lock);
+	}
 
 	if (mhi_pdev->poll_irqs && !READ_ONCE(mhi_cntrl->ctrl_irq_seen)) {
 		WRITE_ONCE(mhi_pdev->poll_paused, false);
