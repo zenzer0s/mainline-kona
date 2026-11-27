@@ -1239,6 +1239,74 @@ static void mhi_pci_poll(struct work_struct *work)
 }
 
 static void mhi_pci_start(struct mhi_pci_device *mhi_pdev);
+static bool mhi_pci_is_alive(struct mhi_controller *mhi_cntrl);
+
+/*
+ * Issue an intentional SoC reset on the flashless SDX55 while masking
+ * upstream Root Port AER reporting / Surprise Down so aerdrv does not
+ * fire a competing Secondary Bus Reset that wedges 0002:01:00.0 in D3cold.
+ */
+static void mhi_pci_soc_reset_quiet(struct mhi_pci_device *mhi_pdev)
+{
+	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
+	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
+	unsigned long deadline;
+#ifdef CONFIG_PCIEAER
+	struct pci_dev *bridge = pci_upstream_bridge(pdev);
+	int br_aer = bridge ? bridge->aer_cap : 0;
+	u32 br_root_cmd = 0, br_uncor_mask = 0, status = 0;
+
+	if (br_aer) {
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_ROOT_COMMAND,
+				      &br_root_cmd);
+		pci_write_config_dword(bridge, br_aer + PCI_ERR_ROOT_COMMAND,
+				       br_root_cmd & ~(PCI_ERR_ROOT_CMD_COR_EN |
+						       PCI_ERR_ROOT_CMD_NONFATAL_EN |
+						       PCI_ERR_ROOT_CMD_FATAL_EN));
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK,
+				      &br_uncor_mask);
+		pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK,
+				       br_uncor_mask | PCI_ERR_UNC_SURPDN);
+	}
+#endif
+
+	mhi_soc_reset(mhi_cntrl);
+	msleep(MHI_POST_RESET_DELAY_MS);
+
+	deadline = jiffies + msecs_to_jiffies(3000);
+	while (time_before(jiffies, deadline) && !mhi_pci_is_alive(mhi_cntrl))
+		msleep(100);
+
+	pci_set_power_state(pdev, PCI_D0);
+	pci_load_saved_state(pdev, mhi_pdev->pci_state);
+	pci_restore_state(pdev);
+	if (pci_enable_device(pdev) == 0)
+		pci_set_master(pdev);
+
+#ifdef CONFIG_PCIEAER
+	if (br_aer) {
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_UNCOR_STATUS, &status);
+		if (status)
+			pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_STATUS, status);
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_COR_STATUS, &status);
+		if (status)
+			pci_write_config_dword(bridge, br_aer + PCI_ERR_COR_STATUS, status);
+		pci_read_config_dword(bridge, br_aer + PCI_ERR_ROOT_STATUS, &status);
+		if (status)
+			pci_write_config_dword(bridge, br_aer + PCI_ERR_ROOT_STATUS, status);
+		pci_write_config_dword(bridge, br_aer + PCI_ERR_UNCOR_MASK, br_uncor_mask);
+		pci_write_config_dword(bridge, br_aer + PCI_ERR_ROOT_COMMAND, br_root_cmd);
+	}
+	if (pdev->aer_cap) {
+		pci_read_config_dword(pdev, pdev->aer_cap + PCI_ERR_UNCOR_STATUS, &status);
+		if (status)
+			pci_write_config_dword(pdev, pdev->aer_cap + PCI_ERR_UNCOR_STATUS, status);
+		pci_read_config_dword(pdev, pdev->aer_cap + PCI_ERR_COR_STATUS, &status);
+		if (status)
+			pci_write_config_dword(pdev, pdev->aer_cap + PCI_ERR_COR_STATUS, status);
+	}
+#endif
+}
 
 static void mhi_pci_fw_wait(struct work_struct *work)
 {
@@ -1246,7 +1314,6 @@ static void mhi_pci_fw_wait(struct work_struct *work)
 						       struct mhi_pci_device, fw_wait_work);
 	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
 	struct device *dev = mhi_cntrl->cntrl_dev;
-	struct pci_dev *pdev = to_pci_dev(dev);
 	const struct firmware *fw;
 	enum mhi_ee_type ee;
 
@@ -1281,10 +1348,7 @@ static void mhi_pci_fw_wait(struct work_struct *work)
 
 		dev_warn(dev, "device in non-PBL ee %d before power-up, issuing SoC reset\n",
 			 ee);
-		mhi_soc_reset(mhi_cntrl);
-		msleep(MHI_POST_RESET_DELAY_MS);
-		pci_load_saved_state(pdev, mhi_pdev->pci_state);
-		pci_restore_state(pdev);
+		mhi_pci_soc_reset_quiet(mhi_pdev);
 		while (time_before(jiffies, deadline)) {
 			ee = mhi_get_exec_env(mhi_cntrl);
 			if (ee == MHI_EE_PBL)
@@ -1566,13 +1630,7 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 	if (mhi_pdev->poll_irqs) {
 		WRITE_ONCE(mhi_cntrl->ctrl_irq_seen, false);
 		/* Flashless SDX55: force SoC reset back to PBL before re-booting */
-		mhi_soc_reset(mhi_cntrl);
-		msleep(MHI_POST_RESET_DELAY_MS);
-		pci_set_power_state(pdev, PCI_D0);
-		pci_load_saved_state(pdev, mhi_pdev->pci_state);
-		pci_restore_state(pdev);
-		if (pci_enable_device(pdev) == 0)
-			pci_set_master(pdev);
+		mhi_pci_soc_reset_quiet(mhi_pdev);
 	}
 
 	if (!mhi_pci_is_alive(mhi_cntrl))
