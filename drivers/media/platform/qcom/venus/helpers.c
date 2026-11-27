@@ -513,8 +513,12 @@ session_process_buf(struct venus_inst *inst, struct vb2_v4l2_buffer *vbuf)
 
 	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
 		fdata.buffer_type = HFI_BUFFER_INPUT;
-		fdata.filled_len = vb2_get_plane_payload(vb, 0);
 		fdata.offset = vb->planes[0].data_offset;
+		fdata.filled_len = vb2_get_plane_payload(vb, 0);
+		if (fdata.filled_len >= fdata.offset)
+			fdata.filled_len -= fdata.offset;
+		else
+			fdata.filled_len = 0;
 
 		if (vbuf->flags & V4L2_BUF_FLAG_LAST || !fdata.filled_len)
 			fdata.flags |= HFI_BUFFERFLAG_EOS;
@@ -1489,8 +1493,12 @@ static void cache_payload(struct venus_inst *inst, struct vb2_buffer *vb)
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	unsigned int idx = vbuf->vb2_buf.index;
 
-	if (vbuf->vb2_buf.type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
-		inst->payloads[idx] = vb2_get_plane_payload(vb, 0);
+	if (vbuf->vb2_buf.type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+		unsigned long payload = vb2_get_plane_payload(vb, 0);
+		unsigned int offset = vb->planes[0].data_offset;
+
+		inst->payloads[idx] = payload >= offset ? payload - offset : 0;
+	}
 }
 
 void venus_helper_vb2_buf_queue(struct vb2_buffer *vb)

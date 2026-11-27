@@ -1536,6 +1536,8 @@ static int venc_close(struct file *file)
 	struct venus_inst *inst = to_inst(file);
 
 	venc_pm_get(inst);
+	if (!inst->buf_count && (inst->state != INST_UNINIT || inst->core_acquired))
+		venc_release_session(inst);
 	venus_close_common(inst, file);
 	inst->enc_state = VENUS_ENC_STATE_DEINIT;
 	venc_pm_put(inst, false);
