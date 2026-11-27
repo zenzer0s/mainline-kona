@@ -75,6 +75,7 @@
 /* Dynamic config IDs (matching OPlus 4.19 synaptics_tcm_oncell) */
 #define DC_NO_DOZE				0x01
 #define DC_IN_WAKEUP_GESTURE_MODE		0x09
+#define DC_TOUCH_HOLD				0xd4
 #define DC_ERROR_PRIORITY			0xd5
 #define DC_NOISE_LENGTH				0xd6
 #define DC_DARK_ZONE_ENABLE			0xdd
@@ -236,12 +237,14 @@ struct tcm_data {
 	u32 gesture_mask;
 	u16 default_noise_length;
 	bool zero_len_cmd_3byte;
+	bool report_ctrl_unsupported;
 	bool game_mode;
 	bool screen_on;
 	bool in_gesture_mode;
 	bool in_deep_sleep;
 	bool irq_wake_enabled;
 	bool irq_disabled;
+	unsigned long last_gesture_jiffies;
 
 	/* annoying state */
 	u16 buf_size;
@@ -435,10 +438,17 @@ static int tcm_set_game_mode_locked(struct tcm_data *tcm, bool enable)
 static int tcm_enable_report(struct tcm_data *tcm, u8 report_type, bool enable)
 {
 	u8 payload = report_type;
+	int ret;
 
-	return tcm_read_message_len(tcm,
-				    enable ? TCM_ENABLE_REPORT : TCM_DISABLE_REPORT,
-				    &payload, sizeof(payload), NULL, 0, NULL);
+	if (tcm->report_ctrl_unsupported)
+		return 0;
+
+	ret = tcm_read_message_len(tcm,
+				   enable ? TCM_ENABLE_REPORT : TCM_DISABLE_REPORT,
+				   &payload, sizeof(payload), NULL, 0, NULL);
+	if (ret == -ETIMEDOUT || ret == -EIO)
+		tcm->report_ctrl_unsupported = true;
+	return ret;
 }
 
 static void tcm_power_off(void *data)
@@ -721,17 +731,46 @@ static void tcm_handle_gesture_report(struct tcm_data *tcm, const u8 *payload, s
 
 	if (gesture_id > 0 && gesture_id <= GESTURE_MAX_ID &&
 	    (tcm->gesture_mask & BIT(gesture_id))) {
-		dev_info(&tcm->client->dev, "gesture detected: lpwg=%#x id=%d key=%d\n",
-			 lpwg, gesture_id, KEY_GESTURE_START + gesture_id);
-		input_report_key(tcm->input, KEY_GESTURE_START + gesture_id, 1);
+		unsigned int key = (gesture_id == GESTURE_DOUBLE_TAP) ?
+				   KEY_WAKEUP : (KEY_GESTURE_START + gesture_id);
+
+		if (gesture_id == GESTURE_DOUBLE_TAP &&
+		    time_before(jiffies, tcm->last_gesture_jiffies + msecs_to_jiffies(100)))
+			return;
+		tcm->last_gesture_jiffies = jiffies;
+
+		pm_wakeup_event(&tcm->client->dev, 1000);
+		dev_info(&tcm->client->dev, "gesture detected: lpwg=%#x id=%d key=%u\n",
+			 lpwg, gesture_id, key);
+		input_report_key(tcm->input, key, 1);
 		input_sync(tcm->input);
-		input_report_key(tcm->input, KEY_GESTURE_START + gesture_id, 0);
+		input_report_key(tcm->input, key, 0);
 		input_sync(tcm->input);
 	}
 }
 
+static void tcm_strip_continued_markers(u8 *buf, size_t start,
+					size_t msg_len, size_t avail_len)
+{
+	size_t i = start;
+
+	if (avail_len < msg_len)
+		avail_len = msg_len;
+
+	while (i + 1 < msg_len && i + 2 <= avail_len) {
+		if (buf[i] == TCM_MESSAGE_MARKER &&
+		    buf[i + 1] == REPORT_CONTINUED_READ) {
+			memmove(&buf[i], &buf[i + 2], avail_len - (i + 2));
+			memset(&buf[avail_len - 2], 0, 2);
+			continue;
+		}
+		i++;
+	}
+}
+
 static int tcm_handle_touch_report_dynamic(struct tcm_data *tcm,
-					   u8 *payload, size_t payload_len)
+					   u8 *payload, size_t payload_len,
+					   size_t avail_payload_len)
 {
 	struct tcm_touch_object objs[TCM_MAX_OBJECTS] = { 0 };
 	const u8 *cfg = tcm->report_config;
@@ -740,6 +779,14 @@ static int tcm_handle_touch_report_dynamic(struct tcm_data *tcm,
 	unsigned int offset = 0, obj = 0, objects = 0, active_objects = 0;
 	unsigned int min_obj_bits = min_t(unsigned int, tcm->report_obj_bits, 56);
 	bool active_only = false, has_num_active = false;
+	size_t avail = max(payload_len, avail_payload_len);
+
+	if (payload_len >= 9 &&
+	    ((payload[0] == REPORT_CONTINUED_READ && payload[1] == TCM_MESSAGE_MARKER) ||
+	     (payload[0] == TCM_MESSAGE_MARKER && payload[1] == REPORT_CONTINUED_READ))) {
+		memmove(&payload[0], &payload[2], avail - 2);
+		memset(&payload[avail - 2], 0, 2);
+	}
 
 	if (tcm->in_gesture_mode) {
 		if (payload_len >= 7 && payload[0] != 0)
@@ -749,19 +796,21 @@ static int tcm_handle_touch_report_dynamic(struct tcm_data *tcm,
 
 	/*
 	 * Aftermarket replacement OnePlus 8T panels may insert a 2-byte
-	 * 0xa5 0x03 transient prefix at bytes [5..6] (shifting Object 0 from
-	 * byte 7 to byte 9) or at bytes [8..9] when (payload[7] & 0x0f) == 0.
+	 * 0x03 0xa5 or 0xa5 0x03 transient prefix at bytes [0..1], [5..6]
+	 * (shifting Object 0 from byte 7 to byte 9), or [8..9] when
+	 * (payload[7] & 0x0f) == 0. Shift across the full read chunk so
+	 * trailing width bytes of Object 0 are recovered instead of zeroed.
 	 */
 	if (payload_len >= 12 && payload[5] == TCM_MESSAGE_MARKER &&
 	    payload[6] == REPORT_CONTINUED_READ &&
 	    payload[7] == 0x00 && payload[8] == 0x00) {
-		memmove(&payload[5], &payload[7], payload_len - 7);
-		memset(&payload[payload_len - 2], 0, 2);
+		memmove(&payload[5], &payload[7], avail - 7);
+		memset(&payload[avail - 2], 0, 2);
 	} else if (payload_len >= 10 && (payload[7] & 0x0f) == 0x00 &&
 		   payload[8] == TCM_MESSAGE_MARKER &&
 		   payload[9] == REPORT_CONTINUED_READ) {
-		memmove(&payload[8], &payload[10], payload_len - 10);
-		memset(&payload[payload_len - 2], 0, 2);
+		memmove(&payload[8], &payload[10], avail - 10);
+		memset(&payload[avail - 2], 0, 2);
 	}
 
 	while (idx < cfg_len) {
@@ -898,7 +947,8 @@ done:
 	return 0;
 }
 
-static int tcm_handle_touch_report(struct tcm_data *tcm, u8 *buf, size_t len)
+static int tcm_handle_touch_report(struct tcm_data *tcm, u8 *buf,
+				   size_t len, size_t avail_len)
 {
 	struct tcm_touch_object objs[TCM_MAX_OBJECTS] = { 0 };
 	const struct tcm_report_point *point;
@@ -912,11 +962,13 @@ static int tcm_handle_touch_report(struct tcm_data *tcm, u8 *buf, size_t len)
 
 	buf += sizeof(struct tcm_message_header);
 	len -= sizeof(struct tcm_message_header);
+	avail_len = (avail_len > sizeof(struct tcm_message_header)) ?
+		    (avail_len - sizeof(struct tcm_message_header)) : len;
 
 	dev_dbg(&tcm->client->dev, "touch report len %zu\n", len);
 
 	if (tcm->report_config_len > 0)
-		return tcm_handle_touch_report_dynamic(tcm, buf, len);
+		return tcm_handle_touch_report_dynamic(tcm, buf, len, avail_len);
 
 	if (len < 1 + sizeof(*point)) {
 		tcm_report_objects(tcm, objs);
@@ -1035,9 +1087,15 @@ static int tcm_read_one_message(struct tcm_data *tcm)
 	print_hex_dump_bytes("report: ", DUMP_PREFIX_OFFSET, buf,
 			     min_t(size_t, sizeof(tcm->irq_buf), total_len));
 
+	/*
+	 * Single-transaction reads (TCM_RD_CHUNK_SIZE = 256) already hold the
+	 * extra bytes shifted out by any injected 0xa5 0x03 marker.
+	 */
+	offset = (total_len <= TCM_RD_CHUNK_SIZE) ? TCM_RD_CHUNK_SIZE : total_len;
+
 	/* Touch indications are always handled directly and must not wake command waiters. */
 	if (header->code == REPORT_TOUCH) {
-		tcm_handle_touch_report(tcm, buf, total_len);
+		tcm_handle_touch_report(tcm, buf, total_len, offset);
 		return 0;
 	}
 
@@ -1045,6 +1103,9 @@ static int tcm_read_one_message(struct tcm_data *tcm)
 	if (header->code != REPORT_OK && header->code != REPORT_IDENTIFY &&
 	    header->code != REPORT_NOT_IMPLEMENTED && header->code != REPORT_ERROR)
 		return 0;
+
+	if (total_len > sizeof(*header))
+		tcm_strip_continued_markers(buf, sizeof(*header), total_len, offset);
 
 	if (!completion_done(&tcm->response)) {
 		tcm->buf_size = total_len;
@@ -1077,13 +1138,112 @@ static const u8 tcm_normal_report_config[] = {
 	TOUCH_END,
 };
 
+static void tcm_program_normal_config_locked(struct tcm_data *tcm, u16 cfg_max_len)
+{
+	u8 cfg_buf[sizeof(struct tcm_message_header) + TCM_MAX_REPORT_CONFIG_SIZE] = { 0 };
+	u16 cfg_total = 0;
+	int ret;
+
+	if (cfg_max_len < TCM_DEFAULT_REPORT_CONFIG_SIZE)
+		cfg_max_len = TCM_DEFAULT_REPORT_CONFIG_SIZE;
+	cfg_max_len = clamp_t(u16, cfg_max_len, sizeof(tcm_normal_report_config),
+			      TCM_MAX_REPORT_CONFIG_SIZE);
+	memcpy(cfg_buf, tcm_normal_report_config, sizeof(tcm_normal_report_config));
+
+	ret = tcm_read_message_len(tcm, TCM_SET_TOUCH_REPORT_CONFIG,
+				   cfg_buf, cfg_max_len, NULL, 0, NULL);
+	if (!ret) {
+		memcpy(tcm->report_config, tcm_normal_report_config,
+		       sizeof(tcm_normal_report_config));
+		tcm->report_config_len = sizeof(tcm_normal_report_config);
+		tcm->report_obj_bits = tcm_calc_obj_bits(tcm->report_config,
+							 tcm->report_config_len);
+		dev_info(&tcm->client->dev,
+			 "programmed normal touch report config (%u bytes, %u bits/obj, %u max_obj)\n",
+			 tcm->report_config_len, tcm->report_obj_bits, tcm->max_objects);
+		return;
+	}
+
+	dev_warn(&tcm->client->dev,
+		 "CMD_SET_TOUCH_REPORT_CONFIG failed (%d), querying device config\n", ret);
+	ret = tcm_read_message_len(tcm, TCM_GET_TOUCH_REPORT_CONFIG, NULL, 0,
+				   cfg_buf, sizeof(cfg_buf), &cfg_total);
+	if (!ret && cfg_total > sizeof(struct tcm_message_header)) {
+		u16 payload_len = min_t(u16, cfg_total - sizeof(struct tcm_message_header),
+					TCM_MAX_REPORT_CONFIG_SIZE);
+
+		memcpy(tcm->report_config,
+		       cfg_buf + sizeof(struct tcm_message_header), payload_len);
+		tcm->report_config_len = payload_len;
+		tcm->report_obj_bits = tcm_calc_obj_bits(tcm->report_config, payload_len);
+		dev_info(&tcm->client->dev,
+			 "loaded device touch report config (%u bytes, %u bits/obj, %u max_obj)\n",
+			 payload_len, tcm->report_obj_bits, tcm->max_objects);
+	} else {
+		memcpy(tcm->report_config, tcm_normal_report_config,
+		       sizeof(tcm_normal_report_config));
+		tcm->report_config_len = sizeof(tcm_normal_report_config);
+		tcm->report_obj_bits = tcm_calc_obj_bits(tcm->report_config,
+							 tcm->report_config_len);
+		dev_warn(&tcm->client->dev,
+			 "failed to fetch touch report config (%d), using normal layout\n",
+			 ret);
+	}
+}
+
+static void tcm_activate_normal_mode_locked(struct tcm_data *tcm, bool reprogram_cfg)
+{
+	int sleep_ret, freq_ret;
+
+	/*
+	 * Always wake the controller out of deep sleep and gesture mode on
+	 * init and screen-on: panel DDIC resets or aftermarket power-on state
+	 * can leave the on-cell IC asleep without setting software flags.
+	 */
+	sleep_ret = tcm_read_message_len(tcm, TCM_EXIT_DEEP_SLEEP, NULL, 0, NULL, 0, NULL);
+	if (sleep_ret == -ETIMEDOUT) {
+		tcm->zero_len_cmd_3byte = !tcm->zero_len_cmd_3byte;
+		sleep_ret = tcm_read_message_len(tcm, TCM_EXIT_DEEP_SLEEP,
+						 NULL, 0, NULL, 0, NULL);
+		if (sleep_ret)
+			tcm->zero_len_cmd_3byte = !tcm->zero_len_cmd_3byte;
+		else
+			dev_info(&tcm->client->dev,
+				 "switched zero-len cmd header to %u-byte on EXIT_DEEP_SLEEP\n",
+				 tcm->zero_len_cmd_3byte ? 3 : 1);
+	}
+	tcm->in_deep_sleep = false;
+	msleep(20);
+
+	if (reprogram_cfg)
+		tcm_program_normal_config_locked(tcm, TCM_DEFAULT_REPORT_CONFIG_SIZE);
+
+	tcm->in_gesture_mode = false;
+	tcm_set_dynamic_config(tcm, DC_IN_WAKEUP_GESTURE_MODE, 0);
+	if (!tcm->gesture_mask)
+		tcm_set_dynamic_config(tcm, DC_GESTURE_MASK, 0);
+	tcm_set_dynamic_config(tcm, DC_TOUCH_HOLD, 0);
+
+	if (tcm->game_mode) {
+		freq_ret = tcm_set_game_mode_locked(tcm, true);
+	} else {
+		freq_ret = tcm_set_dynamic_config(tcm, DC_SET_REPORT_FRE,
+						  TCM_REPORT_RATE_DEFAULT);
+		if (freq_ret)
+			freq_ret = tcm_set_dynamic_config(tcm, DC_SET_REPORT_FRE, 2);
+	}
+
+	tcm_enable_report(tcm, REPORT_TOUCH, true);
+	dev_info(&tcm->client->dev,
+		 "active normal mode set (3byte=%d sleep_exit=%d freq_ret=%d)\n",
+		 tcm->zero_len_cmd_3byte, sleep_ret, freq_ret);
+}
+
 static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 {
 	int ret = 0, retry;
 	struct tcm_identification id = { 0 };
 	struct tcm_app_info app_info = { 0 };
-	u8 cfg_buf[sizeof(struct tcm_message_header) + TCM_MAX_REPORT_CONFIG_SIZE] = { 0 };
-	u16 cfg_total = 0;
 	u16 cfg_max_len = 0;
 	u16 status = APP_STATUS_OK;
 	u32 dt_x = 0, dt_y = 0;
@@ -1192,10 +1352,12 @@ static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 		msleep(20);
 		ret = tcm_read_message(tcm, TCM_GET_APPLICATION_INFO,
 				       &app_info, sizeof(app_info));
-		if (ret == -ETIMEDOUT && retry == 0 && !got_id) {
+		if (ret == -ETIMEDOUT && retry == 0) {
 			tcm->zero_len_cmd_3byte = !tcm->zero_len_cmd_3byte;
 			ret = tcm_read_message(tcm, TCM_GET_APPLICATION_INFO,
 					       &app_info, sizeof(app_info));
+			if (ret)
+				tcm->zero_len_cmd_3byte = !tcm->zero_len_cmd_3byte;
 		}
 		if (ret) {
 			if (ret == -ETIMEDOUT) {
@@ -1213,10 +1375,11 @@ static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 
 	if (got_app_info) {
 		dev_info(&tcm->client->dev,
-			 "Application firmware v%d.%d (customer '%.16s') status %d max=%ux%u\n",
+			 "Application firmware v%d.%d (customer '%.16s') status %d max=%ux%u (%u-byte cmd)\n",
 			 app_info.version[0], app_info.version[1],
 			 app_info.customer_config_id, status,
-			 le16_to_cpu(app_info.max_x), le16_to_cpu(app_info.max_y));
+			 le16_to_cpu(app_info.max_x), le16_to_cpu(app_info.max_y),
+			 tcm->zero_len_cmd_3byte ? 3 : 1);
 		*max_x = le16_to_cpu(app_info.max_x);
 		*max_y = le16_to_cpu(app_info.max_y);
 		tcm->max_objects = clamp_t(u16, get_unaligned_le16(app_info.max_objects),
@@ -1231,63 +1394,23 @@ static int tcm_hw_init(struct tcm_data *tcm, u16 *max_x, u16 *max_y)
 
 	device_property_read_u32(&tcm->client->dev, "touchscreen-size-x", &dt_x);
 	device_property_read_u32(&tcm->client->dev, "touchscreen-size-y", &dt_y);
-	if (*max_x <= 1)
+	if (*max_x <= 1 || *max_x > 4096 || *max_y <= 1 || *max_y > 4096 ||
+	    *max_x >= *max_y) {
 		*max_x = dt_x ? dt_x : TCM_FALLBACK_MAX_X;
-	if (*max_y <= 1)
 		*max_y = dt_y ? dt_y : TCM_FALLBACK_MAX_Y;
-	tcm->max_x = *max_x;
-	tcm->max_y = *max_y;
-
-	/*
-	 * Program the standard 12-bit normal touch report config (matching
-	 * OPlus synaptics_tcm_oncell replacement-panel fix) so payload[0..6]
-	 * is the 7-byte gesture header and payload[7..] starts Object 0,
-	 * ensuring consistent decoding and 0xa5 0x03 transient prefix stripping.
-	 */
-	if (cfg_max_len < TCM_DEFAULT_REPORT_CONFIG_SIZE)
-		cfg_max_len = TCM_DEFAULT_REPORT_CONFIG_SIZE;
-	cfg_max_len = clamp_t(u16, cfg_max_len, sizeof(tcm_normal_report_config),
-			      TCM_MAX_REPORT_CONFIG_SIZE);
-	memcpy(cfg_buf, tcm_normal_report_config, sizeof(tcm_normal_report_config));
-
-	ret = tcm_read_message_len(tcm, TCM_SET_TOUCH_REPORT_CONFIG,
-				   cfg_buf, cfg_max_len, NULL, 0, NULL);
-	if (!ret) {
-		memcpy(tcm->report_config, tcm_normal_report_config,
-		       sizeof(tcm_normal_report_config));
-		tcm->report_config_len = sizeof(tcm_normal_report_config);
-		tcm->report_obj_bits = tcm_calc_obj_bits(tcm->report_config,
-							 tcm->report_config_len);
-		dev_info(&tcm->client->dev,
-			 "programmed normal touch report config (%u bytes, %u bits/obj, %u max_obj)\n",
-			 tcm->report_config_len, tcm->report_obj_bits, tcm->max_objects);
-	} else {
-		dev_warn(&tcm->client->dev,
-			 "CMD_SET_TOUCH_REPORT_CONFIG failed (%d), querying device config\n", ret);
-		ret = tcm_read_message_len(tcm, TCM_GET_TOUCH_REPORT_CONFIG, NULL, 0,
-					   cfg_buf, sizeof(cfg_buf), &cfg_total);
-		if (!ret && cfg_total > sizeof(struct tcm_message_header)) {
-			u16 payload_len = min_t(u16, cfg_total - sizeof(struct tcm_message_header),
-						TCM_MAX_REPORT_CONFIG_SIZE);
-
-			memcpy(tcm->report_config,
-			       cfg_buf + sizeof(struct tcm_message_header), payload_len);
-			tcm->report_config_len = payload_len;
-			tcm->report_obj_bits = tcm_calc_obj_bits(tcm->report_config, payload_len);
-			dev_info(&tcm->client->dev,
-				 "loaded device touch report config (%u bytes, %u bits/obj, %u max_obj)\n",
-				 payload_len, tcm->report_obj_bits, tcm->max_objects);
-		} else {
-			memcpy(tcm->report_config, tcm_normal_report_config,
-			       sizeof(tcm_normal_report_config));
-			tcm->report_config_len = sizeof(tcm_normal_report_config);
-			tcm->report_obj_bits = tcm_calc_obj_bits(tcm->report_config,
-								 tcm->report_config_len);
-			dev_warn(&tcm->client->dev,
-				 "failed to fetch touch report config (%d), using normal layout\n",
-				 ret);
-		}
 	}
+	tcm->max_x = max_t(u16, *max_x, dt_x ? dt_x : TCM_FALLBACK_MAX_X);
+	tcm->max_y = max_t(u16, *max_y, dt_y ? dt_y : TCM_FALLBACK_MAX_Y);
+
+	mutex_lock(&tcm->mode_mutex);
+	/*
+	 * Program report config with firmware's reported size first (matching
+	 * OPlus syna_set_normal_report_config) and transition controller out
+	 * of deep sleep / gesture mode into active normal reporting.
+	 */
+	tcm_program_normal_config_locked(tcm, cfg_max_len);
+	tcm_activate_normal_mode_locked(tcm, false);
+	mutex_unlock(&tcm->mode_mutex);
 
 	/*
 	 * Best-effort disable firmware edge grip / dark zones / dozing that
@@ -1334,19 +1457,7 @@ static void tcm_screen_work_fn(struct work_struct *work)
 			}
 		}
 	} else {
-		if (tcm->in_deep_sleep) {
-			tcm_read_message_len(tcm, TCM_EXIT_DEEP_SLEEP, NULL, 0,
-					     NULL, 0, NULL);
-			tcm->in_deep_sleep = false;
-		}
-		if (tcm->in_gesture_mode) {
-			tcm->in_gesture_mode = false;
-			tcm_set_dynamic_config(tcm, DC_IN_WAKEUP_GESTURE_MODE, 0);
-			dev_info(&tcm->client->dev, "exited wakeup gesture mode\n");
-		}
-		tcm_enable_report(tcm, REPORT_TOUCH, true);
-		if (tcm->game_mode)
-			tcm_set_game_mode_locked(tcm, true);
+		tcm_activate_normal_mode_locked(tcm, true);
 	}
 	mutex_unlock(&tcm->mode_mutex);
 }
@@ -1566,6 +1677,7 @@ static int tcm_probe(struct i2c_client *client)
 	input_set_abs_params(tcm->input, ABS_MT_PRESSURE, 0, 255, 0, 0);
 
 	__set_bit(EV_KEY, tcm->input->evbit);
+	input_set_capability(tcm->input, EV_KEY, KEY_WAKEUP);
 	for (i = 1; i <= GESTURE_MAX_ID; i++)
 		input_set_capability(tcm->input, EV_KEY, KEY_GESTURE_START + i);
 
