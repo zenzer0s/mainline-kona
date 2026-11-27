@@ -25,6 +25,10 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_crtc.h>
 
+#define AMB655X_DEFAULT_BRIGHTNESS	360
+#define AMB655X_NORMAL_MAX_BRIGHTNESS	2047
+#define AMB655X_MAX_BRIGHTNESS		4095
+
 struct amb655x {
 	struct drm_panel panel;
 	struct drm_connector *connector;
@@ -37,6 +41,7 @@ struct amb655x {
 	bool hbm_user;
 	bool hbm_fp;
 	bool hbm_hw;
+	bool bl_hbm;
 	u16 saved_brightness;
 	struct kobject *oplus_kobj;
 };
@@ -202,6 +207,7 @@ static int amb655x_on(struct amb655x *ctx)
 }
 
 static int amb655x_apply_hbm_locked(struct amb655x *ctx, bool enable);
+static int amb655x_apply_brightness_locked(struct amb655x *ctx, u16 brightness);
 
 static int amb655x_enable(struct drm_panel *panel)
 {
@@ -218,6 +224,8 @@ static int amb655x_enable(struct drm_panel *panel)
 		mutex_lock(&ctx->lock);
 		if (ctx->hbm_user || ctx->hbm_fp)
 			amb655x_apply_hbm_locked(ctx, true);
+		else if (ctx->saved_brightness > 0)
+			amb655x_apply_brightness_locked(ctx, ctx->saved_brightness);
 		mutex_unlock(&ctx->lock);
 
 		gf_notify_screen_state(true);
@@ -277,6 +285,7 @@ static int amb655x_prepare(struct drm_panel *panel)
 	mutex_lock(&ctx->lock);
 	ctx->prepared = true;
 	ctx->hbm_hw = false;
+	ctx->bl_hbm = false;
 	mutex_unlock(&ctx->lock);
 
 	return 0;
@@ -292,6 +301,7 @@ static int amb655x_unprepare(struct drm_panel *panel)
 	ctx->prepared = false;
 	ctx->hbm_fp = false;
 	ctx->hbm_hw = false;
+	ctx->bl_hbm = false;
 	mutex_unlock(&ctx->lock);
 
 	gf_notify_screen_state(false);
@@ -366,6 +376,46 @@ static const struct drm_panel_funcs amb655x_panel_funcs = {
 	.get_modes = amb655x_get_modes,
 };
 
+static int amb655x_apply_brightness_locked(struct amb655x *ctx, u16 brightness)
+{
+	struct mipi_dsi_device *dsi = ctx->dsi;
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
+	int ret;
+
+	if (!ctx->prepared)
+		return 0;
+
+	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+
+	/*
+	 * Stock AMB655X unified 0..4095 backlight range:
+	 *   0..2047    -> normal mode (0x53 = 0x20)
+	 *   2048..4095 -> global HBM  (0x53 = 0xE0)
+	 */
+	if (brightness > AMB655X_NORMAL_MAX_BRIGHTNESS) {
+		if (!ctx->bl_hbm) {
+			mipi_dsi_dcs_write_seq_multi(&dsi_ctx,
+						     MIPI_DCS_WRITE_CONTROL_DISPLAY,
+						     0xe0);
+			if (!dsi_ctx.accum_err)
+				ctx->bl_hbm = true;
+		}
+	} else if (ctx->bl_hbm) {
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx,
+					     MIPI_DCS_WRITE_CONTROL_DISPLAY,
+					     0x20);
+		if (!dsi_ctx.accum_err)
+			ctx->bl_hbm = false;
+	}
+
+	ret = dsi_ctx.accum_err;
+	if (!ret)
+		ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+
+	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	return ret < 0 ? ret : 0;
+}
+
 static int amb655x_apply_hbm_locked(struct amb655x *ctx, bool enable)
 {
 	struct mipi_dsi_device *dsi = ctx->dsi;
@@ -388,14 +438,21 @@ static int amb655x_apply_hbm_locked(struct amb655x *ctx, bool enable)
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x51, 0x0c, 0xa8);
 		mipi_dsi_msleep(&dsi_ctx, on_delay_ms);
 	} else {
+		bool keep_bl_hbm = ctx->saved_brightness > AMB655X_NORMAL_MAX_BRIGHTNESS;
+
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x4c);
 		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
-		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0x20);
+		if (keep_bl_hbm)
+			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0xe0);
+		else
+			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x53, 0x20);
 		mipi_dsi_msleep(&dsi_ctx, off_delay_ms);
-		if (!dsi_ctx.accum_err)
+		if (!dsi_ctx.accum_err) {
+			ctx->bl_hbm = keep_bl_hbm;
 			mipi_dsi_dcs_set_display_brightness_large(dsi, ctx->saved_brightness);
+		}
 	}
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
@@ -501,29 +558,33 @@ static int amb655x_bl_update_status(struct backlight_device *bl)
 
 	mutex_lock(&ctx->lock);
 	ctx->saved_brightness = brightness;
-	if (!ctx->hbm_hw) {
-		dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
-		ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
-		dsi->mode_flags |= MIPI_DSI_MODE_LPM;
-	}
+	if (!ctx->hbm_hw)
+		ret = amb655x_apply_brightness_locked(ctx, brightness);
 	mutex_unlock(&ctx->lock);
 
-	return ret < 0 ? ret : 0;
+	return ret;
 }
 
 static int amb655x_bl_get_brightness(struct backlight_device *bl)
 {
 	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	struct amb655x *ctx = mipi_dsi_get_drvdata(dsi);
 	u16 brightness;
 	int ret;
 
+	mutex_lock(&ctx->lock);
+	if (!ctx->prepared || ctx->hbm_hw) {
+		brightness = ctx->saved_brightness;
+		mutex_unlock(&ctx->lock);
+		return brightness;
+	}
+
 	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
-
 	ret = mipi_dsi_dcs_get_display_brightness_large(dsi, &brightness);
-	if (ret < 0)
-		return ret;
-
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	if (ret < 0)
+		brightness = ctx->saved_brightness;
+	mutex_unlock(&ctx->lock);
 
 	return brightness;
 }
@@ -539,8 +600,8 @@ amb655x_create_backlight(struct mipi_dsi_device *dsi)
 	struct device *dev = &dsi->dev;
 	const struct backlight_properties props = {
 		.type = BACKLIGHT_RAW,
-		.brightness = 360,
-		.max_brightness = 2047,
+		.brightness = AMB655X_DEFAULT_BRIGHTNESS,
+		.max_brightness = AMB655X_MAX_BRIGHTNESS,
 	};
 
 	return devm_backlight_device_register(dev, dev_name(dev), dev, dsi,
@@ -573,7 +634,7 @@ static int amb655x_probe(struct mipi_dsi_device *dsi)
 
 	ctx->dsi = dsi;
 	mutex_init(&ctx->lock);
-	ctx->saved_brightness = 360;
+	ctx->saved_brightness = AMB655X_DEFAULT_BRIGHTNESS;
 	mipi_dsi_set_drvdata(dsi, ctx);
 	g_amb655x_ctx = ctx;
 
