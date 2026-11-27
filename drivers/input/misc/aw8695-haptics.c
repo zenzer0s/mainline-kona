@@ -2015,6 +2015,7 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 	while (wait_ms-- > 0 && !atomic_read(&haptics->done_flag)) {
 		smp_rmb();
 		if (opbuf->status == MMAP_BUF_DATA_VALID) {
+			aw8695_pm_qos_enable(haptics, true);
 			mutex_lock(&haptics->lock);
 			if (!atomic_read(&haptics->done_flag)) {
 				/* Keep FF_AEI masked: this loop polls SYSST directly */
@@ -2033,13 +2034,13 @@ static void aw8695_richtap_rtp_work(struct work_struct *work)
 	}
 
 	if (!started) {
+		aw8695_pm_qos_enable(haptics, false);
 		mutex_lock(&haptics->lock);
 		haptics->haptic_rtp_mode = false;
 		mutex_unlock(&haptics->lock);
 		return;
 	}
 
-	aw8695_pm_qos_enable(haptics, true);
 	t_start = ktime_get();
 	while (!atomic_read(&haptics->done_flag)) {
 		if (ktime_us_delta(ktime_get(), t_start) > 800000) {
@@ -2152,22 +2153,25 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 		aw8695_richtap_clean_buf(haptics, MMAP_BUF_DATA_FINISHED);
 		cancel_work_sync(&haptics->haptic_rtp_work);
 
+		/*
+		 * Keep CPUs out of deep idle across the full ~6 ms I2C setup +
+		 * RTP FIFO burst so cold-CPU C-state wakeups do not stretch
+		 * single-byte I2C transactions from ~0.2 ms to ~1.0 ms.
+		 */
+		aw8695_pm_qos_enable(haptics, true);
 		mutex_lock(&haptics->lock);
 		aw8695_haptic_set_rtp_aei(haptics, false);
 		aw8695_haptics_stop(haptics);
 		if (copy_from_user(haptics->rtp_ptr, (void __user *)arg,
 				   RICHTAP_MMAP_BUF_SIZE * RICHTAP_MMAP_BUF_SUM)) {
 			ret = -EFAULT;
-			mutex_unlock(&haptics->lock);
-			mutex_unlock(&haptics->ioctl_lock);
-			return ret;
+			goto out_rtp;
 		}
 		tmp = *(u32 *)haptics->rtp_ptr;
 		if (tmp > (RICHTAP_MMAP_BUF_SIZE * RICHTAP_MMAP_BUF_SUM - 4)) {
 			dev_err(dev, "RichTap RTP length invalid: %u\n", tmp);
-			mutex_unlock(&haptics->lock);
-			mutex_unlock(&haptics->ioctl_lock);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out_rtp;
 		}
 		haptics->haptic_rtp_mode = true;
 		aw8695_haptic_set_bst_vol(haptics, 0x11);
@@ -2176,13 +2180,11 @@ static long aw8695_richtap_ioctl(struct file *file, unsigned int cmd,
 		regmap_update_bits(haptics->regmap, AW8695_GO,
 				   AW8695_GO_ENABLE, AW8695_GO_ENABLE);
 		usleep_range(500, 800);
-		if (tmp > (haptics->ram_base_addr ? haptics->ram_base_addr
-						  : AW8695_RAM_BASE_ADDR))
-			aw8695_pm_qos_enable(haptics, true);
 		ret = aw8695_rtp_write_fifo(haptics, &haptics->rtp_ptr[4], tmp);
-		aw8695_pm_qos_enable(haptics, false);
 		haptics->haptic_rtp_mode = false;
+out_rtp:
 		mutex_unlock(&haptics->lock);
+		aw8695_pm_qos_enable(haptics, false);
 		mutex_unlock(&haptics->ioctl_lock);
 		return ret;
 
