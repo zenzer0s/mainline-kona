@@ -452,6 +452,8 @@ struct mhi_controller {
 	enum mhi_state dbg_last_state;
 	enum mhi_ee_type dbg_last_ee;
 	enum mhi_ee_type dbg_ee_queued;
+	/* set once a real hardware MSI arrives on intvec or ER 0 */
+	bool ctrl_irq_seen;
 
 	/* QTI subsystem failure reason (crash string) buffer, as downstream */
 	char *sfr_buf;

@@ -226,10 +226,10 @@ struct mhi_pci_dev_info {
 		.offload_channel = false,	\
 	}
 
-#define MHI_EVENT_CONFIG_HW_DATA(ev_ring, el_count, ch_num) \
+#define MHI_EVENT_CONFIG_HW_DATA_MOD(ev_ring, el_count, ch_num, intmod) \
 	{					\
 		.num_elements = el_count,	\
-		.irq_moderation_ms = 1,		\
+		.irq_moderation_ms = intmod,	\
 		.irq = (ev_ring) + 1,		\
 		.priority = 1,			\
 		.mode = MHI_DB_BRST_DISABLE,	\
@@ -239,6 +239,9 @@ struct mhi_pci_dev_info {
 		.offload_channel = false,	\
 		.channel = ch_num,		\
 	}
+
+#define MHI_EVENT_CONFIG_HW_DATA(ev_ring, el_count, ch_num) \
+	MHI_EVENT_CONFIG_HW_DATA_MOD(ev_ring, el_count, ch_num, 1)
 
 static const struct mhi_channel_config mhi_qcom_qdu100_channels[] = {
 	MHI_CHANNEL_CONFIG_UL(0, "LOOPBACK", 32, 2),
@@ -587,8 +590,9 @@ static const struct mhi_channel_config mhi_oneplus_sdx55_channels[] = {
 static struct mhi_event_config mhi_oneplus_sdx55_events[] = {
 	MHI_EVENT_CONFIG_CTRL(0, 128),
 	MHI_EVENT_CONFIG_DATA(1, 128),
-	MHI_EVENT_CONFIG_HW_DATA(2, 1024, 100),
-	MHI_EVENT_CONFIG_HW_DATA(3, 2048, 101)
+	/* Match stock SM8250+SDX55 5 ms HW data interrupt moderation */
+	MHI_EVENT_CONFIG_HW_DATA_MOD(2, 1024, 100, 5),
+	MHI_EVENT_CONFIG_HW_DATA_MOD(3, 2048, 101, 5)
 };
 
 static const struct mhi_controller_config modem_oneplus_sdx55_config = {
@@ -1184,6 +1188,16 @@ static void mhi_pci_poll(struct work_struct *work)
 	    !mhi_cntrl->bhi || READ_ONCE(mhi_pdev->poll_paused))
 		return;
 
+	/*
+	 * Once Mission Mode is reached and real hardware MSIs (GICv3 MBI) have
+	 * been observed on the control/intvec rings, stop polling completely.
+	 */
+	if (mhi_cntrl->ee == MHI_EE_AMSS && READ_ONCE(mhi_cntrl->ctrl_irq_seen)) {
+		dev_info_once(mhi_cntrl->cntrl_dev,
+			      "control MSI active in AMSS; stopping poll_work\n");
+		return;
+	}
+
 	active = mhi_poll_irqs(mhi_cntrl);
 	if (mhi_cntrl->ee == MHI_EE_AMSS &&
 	    time_after_eq(jiffies, mhi_pdev->last_intvec_jiffies + HEALTH_CHECK_PERIOD)) {
@@ -1342,6 +1356,10 @@ static void mhi_pci_status_cb(struct mhi_controller *mhi_cntrl,
 	case MHI_CB_SYS_ERROR:
 		dev_warn(&pdev->dev, "firmware crashed (%u)\n", cb);
 		pm_runtime_forbid(&pdev->dev);
+		break;
+	case MHI_CB_IDLE:
+		pm_runtime_mark_last_busy(&pdev->dev);
+		pm_request_autosuspend(&pdev->dev);
 		break;
 	case MHI_CB_EE_MISSION_MODE:
 		/* downstream mhi,sfr-support: have the X55 report its crash reason */
@@ -1512,6 +1530,7 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 		unsigned long deadline = jiffies + msecs_to_jiffies(3000);
 		enum mhi_ee_type ee;
 
+		WRITE_ONCE(mhi_cntrl->ctrl_irq_seen, false);
 		/* Flashless SDX55: force SoC reset back to PBL before re-booting */
 		mhi_soc_reset(mhi_cntrl);
 		msleep(MHI_POST_RESET_DELAY_MS);
@@ -1592,8 +1611,14 @@ static void health_check(struct timer_list *t)
 		return;
 	}
 
-	/* reschedule in two seconds */
-	mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
+	/*
+	 * Avoid kicking PCIe2 out of L1.2 every 2 s while SDX55 is idle/M2:
+	 * use a 30 s health-check cadence in Mission Mode on kebab SDX55.
+	 */
+	if (mhi_pdev->poll_irqs && mhi_cntrl->ee == MHI_EE_AMSS)
+		mod_timer(&mhi_pdev->health_check_timer, jiffies + 30 * HZ);
+	else
+		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
 }
 
 static int mhi_pci_generic_edl_trigger(struct mhi_controller *mhi_cntrl)
@@ -1750,17 +1775,25 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * once the image is readable, so nothing in init has to time it.
 	 */
 	if (info == &mhi_oneplus_sdx55_info) {
-		mhi_pci_map_msi_sink(mhi_pdev, pdev);
+		struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+		bool has_msi_parent = bridge && bridge->dev.parent &&
+				      of_property_present(bridge->dev.parent->of_node,
+							  "msi-parent");
+
+		if (!has_msi_parent)
+			mhi_pci_map_msi_sink(mhi_pdev, pdev);
 		if (pci_pme_capable(pdev, PCI_D3hot)) {
 			device_wakeup_enable(&pdev->dev);
+			if (pdev->bus && pdev->bus->self)
+				device_wakeup_enable(&pdev->bus->self->dev);
 			/*
 			 * Hold runtime PM off until MHI reaches Mission Mode
 			 * (MHI_CB_EE_MISSION_MODE calls pm_runtime_allow()),
-			 * then allow autosuspend into M3/D3hot so PCIe2 can
-			 * enter L1/L1.2 while the modem is idle.
+			 * then allow autosuspend into M3/D3hot (250 ms, matching
+			 * stock MHI_RPM_SUSPEND_TMR_MS) so PCIe2 can enter L1.2.
 			 */
 			pm_runtime_forbid(&pdev->dev);
-			pm_runtime_set_autosuspend_delay(&pdev->dev, 2000);
+			pm_runtime_set_autosuspend_delay(&pdev->dev, 250);
 			pm_runtime_use_autosuspend(&pdev->dev);
 			pm_runtime_mark_last_busy(&pdev->dev);
 			pm_runtime_put_noidle(&pdev->dev);
@@ -2004,7 +2037,7 @@ static int __maybe_unused mhi_pci_runtime_resume(struct device *dev)
 			mhi_cntrl->ee != MHI_EE_AMSS)
 		return 0; /* Nothing to do at MHI level */
 
-	if (mhi_pdev->poll_irqs) {
+	if (mhi_pdev->poll_irqs && !READ_ONCE(mhi_cntrl->ctrl_irq_seen)) {
 		WRITE_ONCE(mhi_pdev->poll_paused, false);
 		mhi_pdev->poll_delay = 1;
 		mhi_pdev->last_intvec_jiffies = jiffies;
@@ -2019,8 +2052,12 @@ static int __maybe_unused mhi_pci_runtime_resume(struct device *dev)
 	}
 
 	/* Resume health check */
-	if (!pdev->is_virtfn)
-		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
+	if (!pdev->is_virtfn) {
+		unsigned long period = (mhi_pdev->poll_irqs &&
+					mhi_cntrl->ee == MHI_EE_AMSS) ?
+				       30 * HZ : HEALTH_CHECK_PERIOD;
+		mod_timer(&mhi_pdev->health_check_timer, jiffies + period);
+	}
 
 	/* It can be a remote wakeup (no mhi runtime_get), update access time */
 	pm_runtime_mark_last_busy(dev);

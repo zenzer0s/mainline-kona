@@ -834,7 +834,6 @@
 
 &pcie0 {
 	vdda-supply = <&vreg_l9a_1p2>;
-	vddpe-3v3-supply = <&vreg_l11c_3p0>;
 
 	status = "okay";
 };
@@ -864,7 +863,6 @@
 
 &pcie2 {
 	vdda-supply = <&vreg_l9a_1p2>;
-	vddpe-3v3-supply = <&vreg_l11c_3p0>;
 
 	status = "okay";
 };

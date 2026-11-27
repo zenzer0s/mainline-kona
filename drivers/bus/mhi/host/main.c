@@ -455,6 +455,9 @@ irqreturn_t mhi_irq_handler(int irq_number, void *dev)
 		return IRQ_HANDLED;
 	}
 
+	if (irq_number != 0 && mhi_event->er_index == 0)
+		WRITE_ONCE(mhi_cntrl->ctrl_irq_seen, true);
+
 	er_ctxt = &mhi_cntrl->mhi_ctxt->er_ctxt[mhi_event->er_index];
 	ptr = le64_to_cpu(er_ctxt->rp);
 
@@ -654,6 +657,9 @@ EXPORT_SYMBOL_GPL(mhi_poll_intvec);
 irqreturn_t mhi_intvec_handler(int irq_number, void *dev)
 {
 	struct mhi_controller *mhi_cntrl = dev;
+
+	if (irq_number != 0)
+		WRITE_ONCE(mhi_cntrl->ctrl_irq_seen, true);
 
 	/* Wake up events waiting for state change */
 	wake_up_all(&mhi_cntrl->state_event);

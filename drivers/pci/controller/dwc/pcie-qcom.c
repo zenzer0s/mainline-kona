@@ -1501,6 +1501,7 @@ static const struct qcom_pcie_cfg cfg_1_0_0 = {
 
 static const struct qcom_pcie_cfg cfg_1_9_0 = {
 	.ops = &ops_1_9_0,
+	.no_l0s = true,
 };
 
 static const struct qcom_pcie_cfg cfg_1_34_0 = {
