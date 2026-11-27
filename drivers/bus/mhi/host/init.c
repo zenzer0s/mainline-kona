@@ -99,6 +99,9 @@ static ssize_t oem_pk_hash_show(struct device *dev,
 	u32 hash_segment[MHI_MAX_OEM_PK_HASH_SEGMENTS];
 	int i, cnt = 0, ret;
 
+	if (!mhi_cntrl->bhi)
+		return -ENODEV;
+
 	for (i = 0; i < MHI_MAX_OEM_PK_HASH_SEGMENTS; i++) {
 		ret = mhi_read_reg(mhi_cntrl, mhi_cntrl->bhi, BHI_OEMPKHASH(i), &hash_segment[i]);
 		if (ret) {

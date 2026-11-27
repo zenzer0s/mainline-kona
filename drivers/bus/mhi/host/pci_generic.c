@@ -1496,15 +1496,29 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 		mhi_unprepare_after_power_down(mhi_cntrl);
 	}
 
-	if (mhi_pdev->poll_irqs) {
-		/* Flashless SDX55: force SoC reset back to PBL before re-booting */
-		mhi_soc_reset(mhi_cntrl);
-		msleep(MHI_POST_RESET_DELAY_MS);
-	}
-
 	pci_set_power_state(pdev, PCI_D0);
 	pci_load_saved_state(pdev, mhi_pdev->pci_state);
 	pci_restore_state(pdev);
+
+	if (mhi_pdev->poll_irqs) {
+		unsigned long deadline = jiffies + msecs_to_jiffies(3000);
+		enum mhi_ee_type ee;
+
+		/* Flashless SDX55: force SoC reset back to PBL before re-booting */
+		mhi_soc_reset(mhi_cntrl);
+		msleep(MHI_POST_RESET_DELAY_MS);
+		pci_set_power_state(pdev, PCI_D0);
+		pci_load_saved_state(pdev, mhi_pdev->pci_state);
+		pci_restore_state(pdev);
+		while (time_before(jiffies, deadline)) {
+			ee = mhi_get_exec_env(mhi_cntrl);
+			if (ee == MHI_EE_PBL)
+				break;
+			msleep(100);
+		}
+		dev_info(&pdev->dev, "recovery post-reset device ee %d\n",
+			 mhi_get_exec_env(mhi_cntrl));
+	}
 
 	if (!mhi_pci_is_alive(mhi_cntrl))
 		goto err_try_reset;
