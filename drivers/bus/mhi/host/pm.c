@@ -133,9 +133,8 @@ enum mhi_pm_state __must_check mhi_tryset_pm_state(struct mhi_controller *mhi_cn
 		return cur_state;
 
 	trace_mhi_tryset_pm_state(mhi_cntrl, state);
-	/* bring-up: show who moves the PM state (kebab X55) */
-	dev_info(&mhi_cntrl->mhi_dev->dev, "pm_state %#lx -> %#x from %pS\n",
-		 cur_state, state, __builtin_return_address(0));
+	dev_dbg(&mhi_cntrl->mhi_dev->dev, "pm_state %#lx -> %#x from %pS\n",
+		cur_state, state, __builtin_return_address(0));
 	mhi_cntrl->pm_state = state;
 	return mhi_cntrl->pm_state;
 }

@@ -606,7 +606,6 @@ static const struct mhi_pci_dev_info mhi_oneplus_sdx55_info = {
 	.dma_data_width = 30,
 	.mru_default = 32768,
 	.sideband_wake = false,
-	.no_m3 = true,
 	.reset_on_remove = true,
 };
 
@@ -1730,8 +1729,20 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 */
 	if (info == &mhi_oneplus_sdx55_info) {
 		mhi_pci_map_msi_sink(mhi_pdev, pdev);
-		if (pci_pme_capable(pdev, PCI_D3hot))
+		if (pci_pme_capable(pdev, PCI_D3hot)) {
 			device_wakeup_enable(&pdev->dev);
+			/*
+			 * Hold runtime PM off until MHI reaches Mission Mode
+			 * (MHI_CB_EE_MISSION_MODE calls pm_runtime_allow()),
+			 * then allow autosuspend into M3/D3hot so PCIe2 can
+			 * enter L1/L1.2 while the modem is idle.
+			 */
+			pm_runtime_forbid(&pdev->dev);
+			pm_runtime_set_autosuspend_delay(&pdev->dev, 5000);
+			pm_runtime_use_autosuspend(&pdev->dev);
+			pm_runtime_mark_last_busy(&pdev->dev);
+			pm_runtime_put_noidle(&pdev->dev);
+		}
 		mhi_pdev->poll_irqs = true;
 		mhi_pdev->fw_waiting = true;
 		mhi_pdev->fw_wait_left = 240;	/* 2 min, every 500 ms */
