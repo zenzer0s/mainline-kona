@@ -36,6 +36,8 @@
 #include <linux/utsname.h>
 #include <linux/workqueue.h>
 
+#include "uefi_kbootlog.h"
+
 #define KLOG_DIR		"/mnt/vendor/persist/klog"
 #define KLOG_NAME		"last_kmsg"
 #define KLOG_MAGIC		0x4B4C4F47	/* "KLOG" */
@@ -82,6 +84,10 @@ static char *klog_saved;
 static size_t klog_saved_len;
 static bool klog_prev_loaded;
 static bool klog_meta_written;
+static bool klog_xbl_tried;
+static bool klog_has_flushed;
+static u32 klog_last_crc;
+static size_t klog_last_len;
 
 static void klog_load_from_disk(void);
 
@@ -143,29 +149,22 @@ static void klog_collect(void)
 
 /*
  * The bootloader log is read once, after kbootlog has captured it, and kept
- * in memory: it never changes for this boot and proc reads are expensive.
+ * in memory: it never changes for this boot.
  */
 static void klog_read_bootloader(void)
 {
-	struct file *f;
-	loff_t pos = 0;
 	ssize_t n;
 
-	if (klog_xbl_len)
+	if (klog_xbl_len || klog_xbl_tried)
 		return;
 
-	f = filp_open("/proc/bootloader_log", O_RDONLY, 0);
-	if (IS_ERR(f))
-		return;
-
-	n = kernel_read(f, klog_xbl, KLOG_MAX_TEXT / 4 - 1, &pos);
-	filp_close(f, NULL);
-
+	n = qcom_kbootlog_copy(klog_xbl, KLOG_MAX_TEXT / 4 - 1);
 	if (n <= 0)
 		return;
 
 	klog_xbl[n] = '\0';
 	klog_xbl_len = n;
+	klog_xbl_tried = true;
 }
 
 static ssize_t klog_write_all(struct file *f, loff_t pos,
@@ -216,8 +215,10 @@ static void klog_flush(struct work_struct *work)
 	if (!klog_interval)
 		return;
 
-	if (!klog_xbl_len)
+	if (!klog_xbl_len && !klog_xbl_tried) {
 		klog_read_bootloader();
+		klog_xbl_tried = true;
+	}
 
 	/*
 	 * Snapshot the previous boot's last_kmsg into memory BEFORE our first
@@ -240,6 +241,9 @@ static void klog_flush(struct work_struct *work)
 	mutex_unlock(&klog_lock);
 
 	if (!len || hdr.magic != KLOG_MAGIC)
+		goto requeue;
+
+	if (klog_has_flushed && len == klog_last_len && hdr.crc == klog_last_crc)
 		goto requeue;
 
 	f = filp_open(klog_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -265,6 +269,10 @@ static void klog_flush(struct work_struct *work)
 		schedule_delayed_work(&klog_work, 1 * HZ);
 		return;
 	}
+
+	klog_last_crc = hdr.crc;
+	klog_last_len = len;
+	klog_has_flushed = true;
 requeue:
 	schedule_delayed_work(&klog_work, klog_interval * HZ);
 }

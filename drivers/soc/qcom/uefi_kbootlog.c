@@ -28,6 +28,8 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 
+#include "uefi_kbootlog.h"
+
 #define KBOOTLOG_MAX_SIZE	0x8000
 
 static char *kbootlog_text;
@@ -35,6 +37,24 @@ static size_t kbootlog_len;
 static phys_addr_t kbootlog_base;
 static size_t kbootlog_size;
 static DEFINE_MUTEX(kbootlog_lock);
+
+ssize_t qcom_kbootlog_copy(char *dst, size_t max)
+{
+	size_t n;
+
+	mutex_lock(&kbootlog_lock);
+	if (!kbootlog_text || !kbootlog_len) {
+		mutex_unlock(&kbootlog_lock);
+		return 0;
+	}
+
+	n = min(kbootlog_len, max);
+	memcpy(dst, kbootlog_text, n);
+	mutex_unlock(&kbootlog_lock);
+
+	return n;
+}
+EXPORT_SYMBOL_GPL(qcom_kbootlog_copy);
 
 static ssize_t kbootlog_read(struct file *file, char __user *buf,
 			     size_t count, loff_t *ppos)
