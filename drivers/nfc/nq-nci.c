@@ -53,6 +53,8 @@ struct nq_nci_dev {
 	bool irq_pending;
 	bool read_pending;
 	bool read_aborted;
+	bool fw_mode;
+	size_t rx_remaining;
 	u8 rx_buf[NQ_NCI_MAX_BUFFER_SIZE];
 	u8 tx_buf[NQ_NCI_MAX_BUFFER_SIZE];
 };
@@ -106,6 +108,7 @@ static int nq_nci_open(struct inode *inode, struct file *filp)
 
 	spin_lock_irqsave(&nq->irq_lock, flags);
 	nq->read_aborted = false;
+	nq->rx_remaining = 0;
 	spin_unlock_irqrestore(&nq->irq_lock, flags);
 
 	filp->private_data = nq;
@@ -191,20 +194,44 @@ static ssize_t nq_nci_read(struct file *filp, char __user *buf,
 		dev_err(&nq->client->dev, "i2c_master_recv failed: %d\n", ret);
 		spin_lock_irqsave(&nq->irq_lock, flags);
 		nq->irq_pending = false;
+		nq->rx_remaining = 0;
 		spin_unlock_irqrestore(&nq->irq_lock, flags);
 		mutex_unlock(&nq->read_mutex);
 		return ret;
 	}
 
 	/*
-	 * Clear irq_pending after reading payload or full frame; if the HAL
-	 * issues a second read for the payload right after the 3-byte header,
-	 * keep irq_pending set until the payload read completes or the next
-	 * select/poll re-arms the level IRQ.
+	 * Track NCI / FW-download header + payload framing so irq_pending is
+	 * cleared as soon as the entire frame has been read — including short
+	 * 0..3 byte NCI responses (e.g. RF_DISCOVER_RSP, CORE_SET_CONFIG_RSP).
+	 * Leaving irq_pending set after a <=3-byte payload caused the next
+	 * select()/read() to issue a spurious I2C read while IRQ was low,
+	 * triggering repeated -ENXIO (-6) errors and slow NFC enable.
 	 */
 	spin_lock_irqsave(&nq->irq_lock, flags);
-	if (count > 3)
+	if (nq->rx_remaining > 0) {
+		if ((size_t)ret >= nq->rx_remaining)
+			nq->rx_remaining = 0;
+		else
+			nq->rx_remaining -= (size_t)ret;
+		if (nq->rx_remaining == 0)
+			nq->irq_pending = false;
+	} else if (nq->fw_mode && ret == 2) {
+		/* NXP FW download frame: 2-byte big-endian 10-bit len + 2-byte CRC */
+		nq->rx_remaining = ((((size_t)nq->rx_buf[0] & 0x03) << 8) |
+				    nq->rx_buf[1]) + 2;
+		if (nq->rx_remaining == 0)
+			nq->irq_pending = false;
+	} else if (!nq->fw_mode && ret == 3) {
+		/* NCI frame: 3-byte header, rx_buf[2] is payload length */
+		nq->rx_remaining = nq->rx_buf[2];
+		if (nq->rx_remaining == 0)
+			nq->irq_pending = false;
+	} else {
+		/* Full-frame read or unknown framing: packet complete */
+		nq->rx_remaining = 0;
 		nq->irq_pending = false;
+	}
 	spin_unlock_irqrestore(&nq->irq_lock, flags);
 
 	if (copy_to_user(buf, nq->rx_buf, ret)) {
@@ -255,12 +282,19 @@ static void nq_nci_set_pwr(struct nq_nci_dev *nq, unsigned long mode)
 		gpiod_set_value_cansleep(nq->fw_gpiod, 0);
 		gpiod_set_value_cansleep(nq->ven_gpiod, 0);
 		msleep(NQ_NCI_GPIO_DELAY_MS);
+		spin_lock_irqsave(&nq->irq_lock, flags);
+		nq->fw_mode = false;
+		nq->rx_remaining = 0;
+		nq->irq_pending = false;
+		spin_unlock_irqrestore(&nq->irq_lock, flags);
 		break;
 	case MODE_POWER_ON:
 		gpiod_set_value_cansleep(nq->fw_gpiod, 0);
 		gpiod_set_value_cansleep(nq->ven_gpiod, 1);
 		msleep(NQ_NCI_GPIO_DELAY_MS);
 		spin_lock_irqsave(&nq->irq_lock, flags);
+		nq->fw_mode = false;
+		nq->rx_remaining = 0;
 		nq->irq_pending = false;
 		spin_unlock_irqrestore(&nq->irq_lock, flags);
 		nq_nci_enable_irq(nq);
@@ -273,6 +307,11 @@ static void nq_nci_set_pwr(struct nq_nci_dev *nq, unsigned long mode)
 		msleep(NQ_NCI_GPIO_DELAY_MS);
 		gpiod_set_value_cansleep(nq->ven_gpiod, 1);
 		msleep(NQ_NCI_GPIO_DELAY_MS);
+		spin_lock_irqsave(&nq->irq_lock, flags);
+		nq->fw_mode = true;
+		nq->rx_remaining = 0;
+		nq->irq_pending = false;
+		spin_unlock_irqrestore(&nq->irq_lock, flags);
 		break;
 	case MODE_ISO_RST:
 	case MODE_POWER_RESET:
@@ -280,14 +319,27 @@ static void nq_nci_set_pwr(struct nq_nci_dev *nq, unsigned long mode)
 		msleep(NQ_NCI_GPIO_DELAY_MS);
 		gpiod_set_value_cansleep(nq->ven_gpiod, 1);
 		msleep(NQ_NCI_GPIO_DELAY_MS);
+		spin_lock_irqsave(&nq->irq_lock, flags);
+		nq->fw_mode = false;
+		nq->rx_remaining = 0;
+		nq->irq_pending = false;
+		spin_unlock_irqrestore(&nq->irq_lock, flags);
 		break;
 	case MODE_FW_DWND_HIGH:
 		gpiod_set_value_cansleep(nq->fw_gpiod, 1);
 		msleep(NQ_NCI_GPIO_DELAY_MS);
+		spin_lock_irqsave(&nq->irq_lock, flags);
+		nq->fw_mode = true;
+		nq->rx_remaining = 0;
+		spin_unlock_irqrestore(&nq->irq_lock, flags);
 		break;
 	case MODE_FW_GPIO_LOW:
 		gpiod_set_value_cansleep(nq->fw_gpiod, 0);
 		msleep(NQ_NCI_GPIO_DELAY_MS);
+		spin_lock_irqsave(&nq->irq_lock, flags);
+		nq->fw_mode = false;
+		nq->rx_remaining = 0;
+		spin_unlock_irqrestore(&nq->irq_lock, flags);
 		break;
 	default:
 		dev_warn(&nq->client->dev, "unknown NFC_SET_PWR mode: %lu\n", mode);
