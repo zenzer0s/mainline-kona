@@ -85,12 +85,6 @@
 			power-domains = <&camcc IPE_0_GDSC>;
 		};
 
-		cam_cc_sbi_gdsc: gdsc-sbi {
-			compatible = "penguin,cam-gdsc-regulator";
-			regulator-name = "sbi_gdsc";
-			power-domains = <&camcc SBI_GDSC>;
-		};
-
 		qcom,cam-req-mgr {
 			compatible = "qcom,cam-req-mgr";
 			status = "okay";
@@ -448,8 +442,8 @@
 				regulator-names = "cam_vio", "cam_vdig", "cam_vana",
 						  "cam_v_custom1", "cam_clk";
 				rgltr-cntrl-support;
-				rgltr-min-voltage = <0 1352000 2900000 2000000 0>;
-				rgltr-max-voltage = <0 1352000 2900000 2000000 0>;
+				rgltr-min-voltage = <0 1352000 2896000 2000000 0>;
+				rgltr-max-voltage = <0 1352000 2904000 2000000 0>;
 				rgltr-load-current = <1000000 1000000 300000 300000 0>;
 				gpio-no-mux = <0>;
 				pinctrl-names = "cam_default", "cam_suspend";
@@ -495,8 +489,8 @@
 				cam_clk-supply = <&cam_cc_titan_top_gdsc>;
 				regulator-names = "cam_vio", "cam_vdig", "cam_vana", "cam_clk";
 				rgltr-cntrl-support;
-				rgltr-min-voltage = <0 1100000 3008000 0>;
-				rgltr-max-voltage = <0 1100000 3800000 0>;
+				rgltr-min-voltage = <0 1096000 3008000 0>;
+				rgltr-max-voltage = <0 1104000 3800000 0>;
 				rgltr-load-current = <1000000 1000000 300000 0>;
 				gpio-no-mux = <0>;
 				pinctrl-names = "cam_default", "cam_suspend";
@@ -590,8 +584,8 @@
 				regulator-names = "cam_vio", "cam_vdig", "cam_vana",
 						  "cam_v_custom1", "cam_vaf", "cam_clk";
 				rgltr-cntrl-support;
-				rgltr-min-voltage = <0 1352000 2900000 2000000 2800000 0>;
-				rgltr-max-voltage = <0 1352000 2900000 2000000 2800000 0>;
+				rgltr-min-voltage = <0 1352000 2896000 2000000 2800000 0>;
+				rgltr-max-voltage = <0 1352000 2904000 2000000 2800000 0>;
 				rgltr-load-current = <1000000 1000000 300000 300000 1000000 0>;
 				gpio-no-mux = <0>;
 				pinctrl-names = "cam_default", "cam_suspend";
@@ -643,8 +637,8 @@
 				cam_clk-supply = <&cam_cc_titan_top_gdsc>;
 				regulator-names = "cam_vio", "cam_vdig", "cam_vana", "cam_clk";
 				rgltr-cntrl-support;
-				rgltr-min-voltage = <0 1100000 3300000 0>;
-				rgltr-max-voltage = <0 1100000 3800000 0>;
+				rgltr-min-voltage = <0 1096000 3300000 0>;
+				rgltr-max-voltage = <0 1104000 3800000 0>;
 				rgltr-load-current = <1000000 1000000 300000 0>;
 				gpio-no-mux = <0>;
 				pinctrl-names = "cam_default", "cam_suspend";
@@ -828,8 +822,8 @@
 				cam_clk-supply = <&cam_cc_titan_top_gdsc>;
 				regulator-names = "cam_vio", "cam_vdig", "cam_vana", "cam_clk";
 				rgltr-cntrl-support;
-				rgltr-min-voltage = <0 1100000 3008000 0>;
-				rgltr-max-voltage = <0 1100000 3800000 0>;
+				rgltr-min-voltage = <0 1096000 3008000 0>;
+				rgltr-max-voltage = <0 1104000 3800000 0>;
 				rgltr-load-current = <1000000 1000000 300000 0>;
 				gpio-no-mux = <0>;
 				pinctrl-names = "cam_default", "cam_suspend";
@@ -912,8 +906,8 @@
 				cam_clk-supply = <&cam_cc_titan_top_gdsc>;
 				regulator-names = "cam_vio", "cam_vdig", "cam_vana", "cam_clk";
 				rgltr-cntrl-support;
-				rgltr-min-voltage = <0 1100000 3008000 0>;
-				rgltr-max-voltage = <0 1100000 3800000 0>;
+				rgltr-min-voltage = <0 1096000 3008000 0>;
+				rgltr-max-voltage = <0 1104000 3800000 0>;
 				rgltr-load-current = <1000000 1000000 300000 0>;
 				gpio-no-mux = <0>;
 				pinctrl-names = "cam_default", "cam_suspend";
@@ -1140,16 +1134,14 @@
 			camnoc-axi-min-ib-bw = <3000000000>;
 			regulator-names = "camss-vdd";
 			camss-vdd-supply = <&cam_cc_titan_top_gdsc>;
-			clock-names = "gcc_ahb_clk",
-				      "gcc_axi_hf_clk",
+			clock-names = "gcc_axi_hf_clk",
 				      "gcc_axi_sf_clk",
 				      "slow_ahb_clk_src",
 				      "cpas_ahb_clk",
 				      "cpas_core_ahb_clk",
 				      "camnoc_axi_clk_src",
 				      "camnoc_axi_clk";
-			clocks = <&gcc GCC_CAMERA_AHB_CLK>,
-				 <&gcc GCC_CAMERA_HF_AXI_CLK>,
+			clocks = <&gcc GCC_CAMERA_HF_AXI_CLK>,
 				 <&gcc GCC_CAMERA_SF_AXI_CLK>,
 				 <&camcc CAM_CC_SLOW_AHB_CLK_SRC>,
 				 <&camcc CAM_CC_CPAS_AHB_CLK>,
@@ -1158,14 +1150,14 @@
 				 <&camcc CAM_CC_CAMNOC_AXI_CLK>;
 			src-clock-name = "camnoc_axi_clk_src";
 			clock-rates =
-				<0 0 0 0 0 0 0 0>,
-				<0 0 0 19200000 0 0 19200000 0>,
-				<0 0 0 80000000 0 0 300000000 0>,
-				<0 0 0 80000000 0 0 400000000 0>,
-				<0 0 0 80000000 0 0 400000000 0>,
-				<0 0 0 80000000 0 0 400000000 0>,
-				<0 0 0 80000000 0 0 400000000 0>,
-				<0 0 0 80000000 0 0 480000000 0>;
+				<0 0 0 0 0 0 0>,
+				<0 0 19200000 0 0 19200000 0>,
+				<0 0 80000000 0 0 300000000 0>,
+				<0 0 80000000 0 0 400000000 0>,
+				<0 0 80000000 0 0 400000000 0>,
+				<0 0 80000000 0 0 400000000 0>,
+				<0 0 80000000 0 0 400000000 0>,
+				<0 0 80000000 0 0 480000000 0>;
 			clock-cntl-level = "suspend", "minsvs", "lowsvs", "svs",
 					   "svs_l1", "nominal", "nominal_l1", "turbo";
 			control-camnoc-axi-clk;

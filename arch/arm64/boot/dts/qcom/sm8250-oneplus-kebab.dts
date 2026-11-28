@@ -311,6 +311,9 @@
 };
 
 &i2c2 {
+	clock-frequency = <400000>;
+	status = "okay";
+
 	pm8008: pmic@8 {
 		compatible = "qcom,pm8008";
 		reg = <0x8>;

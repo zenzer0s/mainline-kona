@@ -1450,24 +1450,6 @@ static struct clk_branch cam_cc_fd_core_uar_clk = {
 	},
 };
 
-static struct clk_branch cam_cc_gdsc_clk = {
-	.halt_reg = 0xc16c,
-	.halt_check = BRANCH_HALT,
-	.clkr = {
-		.enable_reg = 0xc16c,
-		.enable_mask = BIT(0),
-		.hw.init = &(struct clk_init_data){
-			.name = "cam_cc_gdsc_clk",
-			.parent_hws = (const struct clk_hw*[]){
-				&cam_cc_xo_clk_src.clkr.hw
-			},
-			.num_parents = 1,
-			.flags = CLK_IGNORE_UNUSED | CLK_SET_RATE_PARENT,
-			.ops = &clk_branch2_ops,
-		},
-	},
-};
-
 static struct clk_branch cam_cc_icp_ahb_clk = {
 	.halt_reg = 0xc094,
 	.halt_check = BRANCH_HALT,
@@ -2302,7 +2284,6 @@ static struct clk_regmap *cam_cc_sm8250_clocks[] = {
 	[CAM_CC_FD_CORE_CLK] = &cam_cc_fd_core_clk.clkr,
 	[CAM_CC_FD_CORE_CLK_SRC] = &cam_cc_fd_core_clk_src.clkr,
 	[CAM_CC_FD_CORE_UAR_CLK] = &cam_cc_fd_core_uar_clk.clkr,
-	[CAM_CC_GDSC_CLK] = &cam_cc_gdsc_clk.clkr,
 	[CAM_CC_ICP_AHB_CLK] = &cam_cc_icp_ahb_clk.clkr,
 	[CAM_CC_ICP_CLK] = &cam_cc_icp_clk.clkr,
 	[CAM_CC_ICP_CLK_SRC] = &cam_cc_icp_clk_src.clkr,
