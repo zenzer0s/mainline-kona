@@ -511,7 +511,7 @@ static int venus_probe(struct platform_device *pdev)
 
 	ret = venus_firmware_init(core);
 	if (ret)
-		goto err_runtime_disable;
+		goto err_runtime_put;
 
 	ret = venus_boot(core);
 	if (ret)
@@ -571,6 +571,11 @@ err_venus_shutdown:
 	venus_shutdown(core);
 err_firmware_deinit:
 	venus_firmware_deinit(core);
+err_runtime_put:
+	pm_runtime_put_sync(dev);
+	pm_runtime_disable(dev);
+	v4l2_device_unregister(&core->v4l2_dev);
+	goto err_hfi_destroy;
 err_runtime_disable:
 	pm_runtime_put_noidle(dev);
 	pm_runtime_disable(dev);
@@ -701,15 +706,28 @@ static __maybe_unused int venus_runtime_resume(struct device *dev)
 
 	ret = icc_set_bw(core->cpucfg_path, kbps_to_icc(1000), 0);
 	if (ret)
-		return ret;
+		goto err_cpucfg_path;
 
 	if (pm_ops->core_power) {
 		ret = pm_ops->core_power(core, POWER_ON);
 		if (ret)
-			return ret;
+			goto err_core_power;
 	}
 
-	return hfi_core_resume(core, false);
+	ret = hfi_core_resume(core, false);
+	if (ret)
+		goto err_hfi_resume;
+
+	return 0;
+
+err_hfi_resume:
+	if (pm_ops->core_power)
+		pm_ops->core_power(core, POWER_OFF);
+err_core_power:
+	icc_set_bw(core->cpucfg_path, 0, 0);
+err_cpucfg_path:
+	icc_set_bw(core->video_path, 0, 0);
+	return ret;
 }
 
 static const struct dev_pm_ops venus_pm_ops = {
