@@ -343,43 +343,43 @@
 		};
 
 		regulators {
-			ldo1 {
+			pm8008_l1: ldo1 {
 				regulator-name = "vreg_l1p";
 				regulator-min-microvolt = <528000>;
 				regulator-max-microvolt = <1504000>;
 			};
 
-			ldo2 {
+			pm8008_l2: ldo2 {
 				regulator-name = "vreg_l2p";
 				regulator-min-microvolt = <528000>;
 				regulator-max-microvolt = <1300000>;
 			};
 
-			ldo3 {
+			pm8008_l3: ldo3 {
 				regulator-name = "vreg_l3p";
 				regulator-min-microvolt = <1500000>;
 				regulator-max-microvolt = <3400000>;
 			};
 
-			ldo4 {
+			pm8008_l4: ldo4 {
 				regulator-name = "vreg_l4p";
 				regulator-min-microvolt = <1800000>;
 				regulator-max-microvolt = <1800000>;
 			};
 
-			ldo5 {
+			pm8008_l5: ldo5 {
 				regulator-name = "vreg_l5p";
 				regulator-min-microvolt = <1500000>;
 				regulator-max-microvolt = <3400000>;
 			};
 
-			ldo6 {
+			pm8008_l6: ldo6 {
 				regulator-name = "vreg_l6p";
 				regulator-min-microvolt = <1500000>;
 				regulator-max-microvolt = <3400000>;
 			};
 
-			ldo7 {
+			pm8008_l7: ldo7 {
 				regulator-name = "vreg_l7p";
 				regulator-min-microvolt = <1500000>;
 				regulator-max-microvolt = <3400000>;
@@ -917,3 +917,5 @@
 &crypto {
 	status = "disabled";
 };
+
+#include "sm8250-oneplus-kebab-camera.dtsi"
