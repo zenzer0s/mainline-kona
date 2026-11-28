@@ -147,6 +147,11 @@ static const struct clk_parent_data gcc_parent_data_2[] = {
 	{ .fw_name = "sleep_clk" },
 };
 
+static const struct clk_parent_data gcc_parent_data_2_ao[] = {
+	{ .fw_name = "bi_tcxo_ao" },
+	{ .fw_name = "sleep_clk" },
+};
+
 static const struct parent_map gcc_parent_map_3[] = {
 	{ P_BI_TCXO, 0 },
 };
@@ -270,8 +275,8 @@ static struct clk_rcg2 gcc_pcie_0_aux_clk_src = {
 	.freq_tbl = ftbl_gcc_pcie_0_aux_clk_src,
 	.clkr.hw.init = &(struct clk_init_data){
 		.name = "gcc_pcie_0_aux_clk_src",
-		.parent_data = gcc_parent_data_2,
-		.num_parents = ARRAY_SIZE(gcc_parent_data_2),
+		.parent_data = gcc_parent_data_2_ao,
+		.num_parents = ARRAY_SIZE(gcc_parent_data_2_ao),
 		.ops = &clk_rcg2_ops,
 	},
 };
@@ -284,8 +289,8 @@ static struct clk_rcg2 gcc_pcie_1_aux_clk_src = {
 	.freq_tbl = ftbl_gcc_pcie_0_aux_clk_src,
 	.clkr.hw.init = &(struct clk_init_data){
 		.name = "gcc_pcie_1_aux_clk_src",
-		.parent_data = gcc_parent_data_2,
-		.num_parents = ARRAY_SIZE(gcc_parent_data_2),
+		.parent_data = gcc_parent_data_2_ao,
+		.num_parents = ARRAY_SIZE(gcc_parent_data_2_ao),
 		.ops = &clk_rcg2_ops,
 	},
 };
@@ -298,8 +303,8 @@ static struct clk_rcg2 gcc_pcie_2_aux_clk_src = {
 	.freq_tbl = ftbl_gcc_pcie_0_aux_clk_src,
 	.clkr.hw.init = &(struct clk_init_data){
 		.name = "gcc_pcie_2_aux_clk_src",
-		.parent_data = gcc_parent_data_2,
-		.num_parents = ARRAY_SIZE(gcc_parent_data_2),
+		.parent_data = gcc_parent_data_2_ao,
+		.num_parents = ARRAY_SIZE(gcc_parent_data_2_ao),
 		.ops = &clk_rcg2_ops,
 	},
 };

@@ -3162,6 +3162,8 @@ struct qmp_pcie {
 	void __iomem *port_b;
 
 	struct clk_bulk_data *clks;
+	struct clk *refgen_clk;
+	unsigned long refgen_rate;
 	struct clk_bulk_data pipe_clks[2];
 	int num_pipe_clks;
 
@@ -4778,7 +4780,7 @@ static int qmp_pcie_clk_init(struct qmp_pcie *qmp)
 {
 	struct device *dev = qmp->dev;
 	int num = ARRAY_SIZE(qmp_pciephy_clk_l);
-	int i;
+	int i, ret;
 
 	qmp->clks = devm_kcalloc(dev, num, sizeof(*qmp->clks), GFP_KERNEL);
 	if (!qmp->clks)
@@ -4787,7 +4789,20 @@ static int qmp_pcie_clk_init(struct qmp_pcie *qmp)
 	for (i = 0; i < num; i++)
 		qmp->clks[i].id = qmp_pciephy_clk_l[i];
 
-	return devm_clk_bulk_get_optional(dev, num, qmp->clks);
+	ret = devm_clk_bulk_get_optional(dev, num, qmp->clks);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < num; i++) {
+		if (!strcmp(qmp->clks[i].id, "refgen")) {
+			qmp->refgen_clk = qmp->clks[i].clk;
+			if (qmp->refgen_clk)
+				qmp->refgen_rate = clk_get_rate(qmp->refgen_clk);
+			break;
+		}
+	}
+
+	return 0;
 }
 
 static void phy_clk_release_provider(void *res)
@@ -5105,6 +5120,7 @@ static int qmp_pcie_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	qmp->dev = dev;
+	platform_set_drvdata(pdev, qmp);
 
 	qmp->cfg = of_device_get_match_data(dev);
 	if (!qmp->cfg)
@@ -5282,11 +5298,49 @@ static const struct of_device_id qmp_pcie_of_match_table[] = {
 };
 MODULE_DEVICE_TABLE(of, qmp_pcie_of_match_table);
 
+#define QMP_PCIE_REFGEN_SLEEP_RATE		19200000
+
+static int qmp_pcie_suspend_noirq(struct device *dev)
+{
+	struct qmp_pcie *qmp = dev_get_drvdata(dev);
+	unsigned long rate;
+
+	if (!qmp || !qmp->refgen_clk)
+		return 0;
+
+	rate = clk_get_rate(qmp->refgen_clk);
+	if (rate > QMP_PCIE_REFGEN_SLEEP_RATE)
+		qmp->refgen_rate = rate;
+
+	if (qmp->refgen_rate > QMP_PCIE_REFGEN_SLEEP_RATE)
+		clk_set_rate(qmp->refgen_clk, QMP_PCIE_REFGEN_SLEEP_RATE);
+
+	return 0;
+}
+
+static int qmp_pcie_resume_noirq(struct device *dev)
+{
+	struct qmp_pcie *qmp = dev_get_drvdata(dev);
+
+	if (!qmp || !qmp->refgen_clk)
+		return 0;
+
+	if (qmp->refgen_rate > QMP_PCIE_REFGEN_SLEEP_RATE)
+		clk_set_rate(qmp->refgen_clk, qmp->refgen_rate);
+
+	return 0;
+}
+
+static const struct dev_pm_ops qmp_pcie_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(qmp_pcie_suspend_noirq, qmp_pcie_resume_noirq)
+};
+
 static struct platform_driver qmp_pcie_driver = {
 	.probe		= qmp_pcie_probe,
 	.driver = {
 		.name	= "qcom-qmp-pcie-phy",
 		.of_match_table = qmp_pcie_of_match_table,
+		.pm	= pm_sleep_ptr(&qmp_pcie_pm_ops),
 	},
 };
 
