@@ -69,25 +69,19 @@ static int qcom_rng_read(struct qcom_rng *rng, u8 *data, unsigned int max)
 	return currsize;
 }
 
-static int qcom_hwrng_init(struct hwrng *hwrng)
-{
-	struct qcom_rng *qrng = container_of(hwrng, struct qcom_rng, hwrng);
-
-	return clk_prepare_enable(qrng->clk);
-}
-
 static int qcom_hwrng_read(struct hwrng *hwrng, void *data, size_t max, bool wait)
 {
 	struct qcom_rng *qrng = container_of(hwrng, struct qcom_rng, hwrng);
+	int ret;
 
-	return qcom_rng_read(qrng, data, max);
-}
+	ret = clk_prepare_enable(qrng->clk);
+	if (ret)
+		return ret;
 
-static void qcom_hwrng_cleanup(struct hwrng *hwrng)
-{
-	struct qcom_rng *qrng = container_of(hwrng, struct qcom_rng, hwrng);
-
+	ret = qcom_rng_read(qrng, data, max);
 	clk_disable_unprepare(qrng->clk);
+
+	return ret;
 }
 
 static struct qcom_rng_match_data qcom_trng_match_data;
@@ -121,9 +115,7 @@ static int qcom_rng_probe(struct platform_device *pdev)
 		return PTR_ERR(rng->clk);
 
 	rng->hwrng.name = "qcom_hwrng";
-	rng->hwrng.init = qcom_hwrng_init;
 	rng->hwrng.read = qcom_hwrng_read;
-	rng->hwrng.cleanup = qcom_hwrng_cleanup;
 	rng->hwrng.quality = match_data == &qcom_trng_match_data ?
 			     QCOM_TRNG_QUALITY : 0;
 	ret = devm_hwrng_register(&pdev->dev, &rng->hwrng);
